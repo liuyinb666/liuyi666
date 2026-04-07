@@ -32,11 +32,15 @@ from telegram.error import BadRequest
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, PhoneCodeExpiredError
 
+
 # ==================== 配置 ====================
 class Config:
-    BOT_TOKEN = '8402172181:AAFXAfGcMrm8uVthFBfp57ahMULP2o3ZyeY'
-    API_ID = 2040
-    API_HASH = 'b18441a1ff607e10a989891a5462e627'
+    import os
+    # 加空值兜底，构建阶段读不到变量也不会报错
+    BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+    API_ID = int(os.environ.get('API_ID', 0))
+    API_HASH = os.environ.get('API_HASH', '')
+
     PC28_API_BASE = "https://www.pc28.ai/api"
     ADMIN_USER_IDS = [5338954122]
 
