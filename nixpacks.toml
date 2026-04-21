@@ -1,4 +1,3 @@
-cat > nixpacks.toml << 'EOF'
 [phases.setup]
 nixPkgs = ["python311", "gcc"]
 
@@ -7,4 +6,3 @@ cmds = ["pip install --no-cache-dir -r requirements.txt"]
 
 [start]
 cmd = "python auto_3.3.py"
-EOF
