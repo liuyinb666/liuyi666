@@ -176,6 +176,7 @@ class BotLogger:
     def log_error(self, user_id, action, error):
         error_trace = traceback.format_exc(); self.logger.error(f"[错误] 用户:{user_id} {action}: {error}\n{error_trace}")
     def log_api(self, action, detail): self.logger.debug(f"[API] {action} {detail}")
+    def log_heartbeat(self): self.logger.info("[心跳] 系统运行正常")
     def _mask_phone(self, phone: str) -> str:
         if len(phone) >= 8: return phone[:5] + "****" + phone[-3:]
         return phone
@@ -1585,21 +1586,23 @@ class AccountManager:
                 if not connected:
                     logger.log_system(f"账户 {phone} 连接失效，已标记为未登录")
 
+    # 已禁用启动时重置自动投注标志
     async def reset_auto_flags_on_start(self):
-    # 修复：不再强制重置自动投注标志，保持用户设置
-    auto_count = sum(1 for acc in self.accounts.values() if acc.auto_betting)
-    broadcast_count = sum(1 for acc in self.accounts.values() if acc.prediction_broadcast)
-    logger.log_system(f"启动时账户状态: 自动投注={auto_count}, 播报={broadcast_count} (保持原有设置)")
-    # 不执行任何重置操作
+        # 不再重置任何自动标志
+        logger.log_system("启动时保留账户的自动投注和播报标志（已禁用重置）")
+        # 可选：仅输出当前状态日志
+        for phone, acc in self.accounts.items():
+            if acc.auto_betting or acc.prediction_broadcast:
+                logger.log_system(f"账户 {phone} 当前状态: auto_betting={acc.auto_betting}, broadcast={acc.prediction_broadcast} (保留)")
 
-async def start_periodic_save(self):
-    self._save_task = asyncio.create_task(self._periodic_save())
+    async def start_periodic_save(self):
+        self._save_task = asyncio.create_task(self._periodic_save())
 
-async def stop_periodic_save(self):
-    if self._save_task:
-        self._save_task.cancel()
-        try: await self._save_task
-        except asyncio.CancelledError: pass
+    async def stop_periodic_save(self):
+        if self._save_task:
+            self._save_task.cancel()
+            try: await self._save_task
+            except asyncio.CancelledError: pass
 
 # ==================== 金额管理器 ====================
 class AmountManager:
@@ -2334,6 +2337,7 @@ class GlobalScheduler:
         self.check_interval = Config.SCHEDULER_CHECK_INTERVAL
         self.health_check_interval = Config.HEALTH_CHECK_INTERVAL
         self.last_health_check = 0
+        self.last_heartbeat_log = 0  # 心跳日志记录时间
         self.bet_semaphore = asyncio.Semaphore(Config.MAX_CONCURRENT_BETS)
         self.tasks = set()
         self._prediction_lock = asyncio.Lock()
@@ -2392,6 +2396,12 @@ class GlobalScheduler:
         while self.running:
             try:
                 now = datetime.now()
+                
+                # 心跳日志 - 每60秒输出一次
+                if (now.timestamp() - self.last_heartbeat_log) >= 60:
+                    logger.log_heartbeat()
+                    self.last_heartbeat_log = now.timestamp()
+                
                 if self._is_maintenance_time(now):
                     logger.log_system("当前处于维护时段，暂停实时检测，开始下载历史数据...")
                     asyncio.create_task(self._download_history_during_maintenance())
