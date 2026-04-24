@@ -2095,7 +2095,7 @@ class BettingStrategyManager:
                     'multiplier': 2.5, 'stop_loss': 1000000, 'stop_win': 500000,
                     'stop_balance': 200000, 'resume_balance': 1000000},
             '马丁格尔': {'description': '马丁格尔策略', 'base_amount': 10000, 'max_amount': 10000000,
-                        'multiplier': 2.0, 'stop_loss': 5000000, 'stop_win': 1000000,
+                        'multiplier': 2.5, 'stop_loss': 5000000, 'stop_win': 1000000,
                         'stop_balance': 500000, 'resume_balance': 2000000},
             '斐波那契': {'description': '斐波那契策略', 'base_amount': 10000, 'max_amount': 10000000,
                         'multiplier': 1.0, 'stop_loss': 5000000, 'stop_win': 1000000,
