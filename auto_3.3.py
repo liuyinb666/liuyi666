@@ -93,6 +93,10 @@ class Config:
     MARTINGALE_WIN_BOOST_MAX = 2.0           # 最大倍数（2倍）
     MARTINGALE_WIN_BOOST_START = 3            # 从第几期连胜开始加码（3期）
     
+    # 开奖信息检测配置（检测群里的开奖信息后触发投注）
+    GAME_INFO_KEYWORDS = ["期号:", "封盘时间:", "开奖时间:", "庄家"]  # 检测开奖信息的关键词
+    GAME_INFO_BET_TRIGGER = True  # 是否检测到开奖信息后立即投注
+    
     # ==================== 多币种配置 ====================
     AVAILABLE_CURRENCIES = ["KKCOIN", "USDT", "CNY"]
     DEFAULT_CURRENCY = "KKCOIN"
@@ -1746,6 +1750,7 @@ class GameScheduler:
         self.model = model_manager
         self.api = api_client
         self.game_stats = {'total_cycles':0, 'betting_cycles':0, 'successful_bets':0, 'failed_bets':0, 'total_profit':0, 'total_loss':0}
+        self._last_game_info = None  # 存储最近检测到的开奖信息
 
     async def start_auto_betting(self, phone, user_id):
         acc = self.account_manager.get_account(phone)
@@ -1763,6 +1768,79 @@ class GameScheduler:
         await self.account_manager.update_account(phone, auto_betting=False)
         logger.log_betting(user_id, "自动投注关闭", f"账户:{phone}")
         return True, "自动投注已关闭"
+
+    async def check_game_info_message(self, phone: str, message_text: str) -> Optional[Dict]:
+        """检测是否收到了开奖信息消息，如果是则提取期号并返回"""
+        acc = self.account_manager.get_account(phone)
+        if not acc:
+            return None
+        
+        # 检查是否包含开奖信息的关键词
+        has_period = "期号" in message_text or "期号:" in message_text
+        has_close_time = "封盘时间" in message_text or "封盘时间:" in message_text
+        has_open_time = "开奖时间" in message_text or "开奖时间:" in message_text
+        
+        if has_period and (has_close_time or has_open_time):
+            # 提取期号
+            period_match = re.search(r'期号[：:]\s*(\d+)', message_text)
+            if period_match:
+                qihao = period_match.group(1)
+                logger.log_betting(0, "检测到开奖信息", f"账户:{phone} 期号:{qihao}")
+                
+                # 提取封盘时间
+                close_match = re.search(r'封盘时间[：:]\s*(\d{1,2}:\d{2}:\d{2})', message_text)
+                close_time = close_match.group(1) if close_match else None
+                
+                # 提取开奖时间
+                open_match = re.search(r'开奖时间[：:]\s*(\d{1,2}:\d{2}:\d{2})', message_text)
+                open_time = open_match.group(1) if open_match else None
+                
+                game_info = {
+                    'qihao': qihao,
+                    'close_time': close_time,
+                    'open_time': open_time,
+                    'full_message': message_text[:500]
+                }
+                self._last_game_info = game_info
+                return game_info
+        return None
+    
+    async def execute_bet_on_game_info(self, phone: str, game_info: Dict):
+        """检测到开奖信息后执行投注"""
+        acc = self.account_manager.get_account(phone)
+        if not acc or not acc.auto_betting:
+            logger.log_betting(0, "自动投注未开启，跳过", f"账户:{phone}")
+            return False
+        
+        qihao = game_info['qihao']
+        
+        # 检查是否已经对这个期号投注过
+        if acc.last_bet_period == qihao:
+            logger.log_betting(0, "该期号已投注过，跳过", f"账户:{phone} 期号:{qihao}")
+            return False
+        
+        logger.log_betting(0, "开奖信息触发投注", f"账户:{phone} 期号:{qihao}")
+        
+        # 获取最新开奖结果（上一期）
+        latest = await self.api.get_latest_result()
+        if not latest:
+            logger.log_error(phone, "获取最新开奖结果失败", None)
+            return False
+        
+        # 获取历史数据并预测
+        history = await self.api.get_history(50)
+        if len(history) < 3:
+            logger.log_error(phone, "历史数据不足", None)
+            return False
+        
+        prediction = await self.model.predict(history, latest)
+        
+        # 保存开奖信息中的封盘时间用于后续检查
+        if game_info.get('close_time'):
+            self._last_game_info = game_info
+        
+        # 执行投注
+        return await self.execute_bet(phone, prediction, latest)
 
     async def check_bet_result(self, phone, expected_qihao, latest_result):
         acc = self.account_manager.get_account(phone)
@@ -1968,10 +2046,26 @@ class GameScheduler:
             if acc.last_bet_period == current_qihao: 
                 return
             now = datetime.now()
+            
+            # 检查是否收到开奖信息中的封盘时间
+            close_time_str = None
+            if self._last_game_info and self._last_game_info.get('close_time'):
+                close_time_str = self._last_game_info.get('close_time')
+                # 检查是否已经超过封盘时间
+                try:
+                    close_dt = datetime.strptime(close_time_str, "%H:%M:%S")
+                    close_dt = close_dt.replace(year=now.year, month=now.month, day=now.day)
+                    if now >= close_dt:
+                        logger.log_betting(0, "已封盘（根据消息中的封盘时间）", f"账户:{phone} 封盘时间:{close_time_str}")
+                        return
+                except Exception as e:
+                    logger.log_error(phone, f"解析封盘时间失败 {close_time_str}", e)
+            
+            # 原有的封盘检查逻辑（作为备选）
             next_open = latest['parsed_time'] + timedelta(seconds=Config.GAME_CYCLE_SECONDS)
             close_time = next_open - timedelta(seconds=Config.CLOSE_BEFORE_SECONDS)
-            if now >= close_time: 
-                logger.log_betting(0, "已封盘，跳过投注", f"账户:{phone}")
+            if now >= close_time and not close_time_str: 
+                logger.log_betting(0, "已封盘（根据周期计算），跳过投注", f"账户:{phone}")
                 return
             
             balances = await self._query_balance(phone)
@@ -2054,22 +2148,22 @@ class GameScheduler:
             if losses > 0:
                 # 连输时：按马丁格尔翻倍
                 amt = base * (mult ** losses)
-                updates['martingale_reset'] = False
                 logger.log_betting(0, "马丁格尔连输翻倍", 
                     f"账户:{acc.phone} 连输{losses}期，倍数:{mult ** losses:.1f}，金额:{amt:.2f}")
             elif wins >= Config.MARTINGALE_WIN_BOOST_START and Config.MARTINGALE_WIN_BOOST_ENABLED:
                 # 连胜时：按连胜倍数增加（连胜加码）
-                win_multiplier = 1 + (wins * Config.MARTINGALE_WIN_BOOST_RATE)
+                # 连胜加码倍数 = 1 + (连胜期数 - 起始期数 + 1) * 增长率
+                boost_extra = wins - Config.MARTINGALE_WIN_BOOST_START + 1
+                win_multiplier = 1 + (boost_extra * Config.MARTINGALE_WIN_BOOST_RATE)
                 win_multiplier = min(win_multiplier, Config.MARTINGALE_WIN_BOOST_MAX)
                 amt = base * win_multiplier
-                updates['martingale_reset'] = False
                 logger.log_betting(0, "马丁格尔连胜加码", 
                     f"账户:{acc.phone} 连胜{wins}期，倍数:{win_multiplier:.2f}，金额:{amt:.2f}")
             else:
-                # 正常情况或重置后：使用基础金额
+                # 正常情况：使用基础金额
                 amt = base
-                if wins == 0 or acc.martingale_reset:
-                    updates['martingale_reset'] = False
+                logger.log_betting(0, "马丁格尔基础投注", 
+                    f"账户:{acc.phone} 连胜{wins}期，金额:{amt:.2f}")
                     
         elif strategy == '斐波那契':
             # 斐波那契策略（保留原逻辑+可选连胜加码）
@@ -2078,7 +2172,8 @@ class GameScheduler:
                 idx = min(losses, len(fib)-1)
                 amt = base * fib[idx]
             elif wins >= Config.MARTINGALE_WIN_BOOST_START and Config.MARTINGALE_WIN_BOOST_ENABLED:
-                win_multiplier = 1 + (wins * Config.MARTINGALE_WIN_BOOST_RATE)
+                boost_extra = wins - Config.MARTINGALE_WIN_BOOST_START + 1
+                win_multiplier = 1 + (boost_extra * Config.MARTINGALE_WIN_BOOST_RATE)
                 win_multiplier = min(win_multiplier, Config.MARTINGALE_WIN_BOOST_MAX)
                 amt = base * win_multiplier
             else:
@@ -2089,7 +2184,8 @@ class GameScheduler:
             if losses > 0:
                 amt = base * (1 + losses)
             elif wins >= Config.MARTINGALE_WIN_BOOST_START and Config.MARTINGALE_WIN_BOOST_ENABLED:
-                win_multiplier = 1 + (wins * Config.MARTINGALE_WIN_BOOST_RATE)
+                boost_extra = wins - Config.MARTINGALE_WIN_BOOST_START + 1
+                win_multiplier = 1 + (boost_extra * Config.MARTINGALE_WIN_BOOST_RATE)
                 win_multiplier = min(win_multiplier, Config.MARTINGALE_WIN_BOOST_MAX)
                 amt = base * win_multiplier
             else:
@@ -2097,7 +2193,8 @@ class GameScheduler:
         else:
             # 保守/平衡策略（可选连胜加码）
             if wins >= Config.MARTINGALE_WIN_BOOST_START and Config.MARTINGALE_WIN_BOOST_ENABLED:
-                win_multiplier = 1 + (wins * Config.MARTINGALE_WIN_BOOST_RATE * 0.5)  # 保守策略加码幅度减半
+                boost_extra = wins - Config.MARTINGALE_WIN_BOOST_START + 1
+                win_multiplier = 1 + (boost_extra * Config.MARTINGALE_WIN_BOOST_RATE * 0.5)  # 保守策略加码幅度减半
                 win_multiplier = min(win_multiplier, 1.5)
                 amt = base * win_multiplier
             else:
@@ -2347,6 +2444,10 @@ class GlobalScheduler:
             
             await self.prediction_broadcaster.update_global_predictions(prediction, next_qihao, latest)
             
+            # 注意：由于启用了开奖信息检测模式，这里不再自动投注
+            # 投注将由收到开奖信息消息时触发
+            # 如果需要同时支持两种模式，可以取消下面的注释
+            """
             bet_tasks = []
             for phone, acc in self.account_manager.accounts.items():
                 if (acc.auto_betting and acc.is_logged_in and acc.game_group_id and acc.last_bet_period != qihao):
@@ -2358,6 +2459,7 @@ class GlobalScheduler:
                 for i, res in enumerate(results):
                     if isinstance(res, Exception):
                         logger.log_error(0, f"投注任务 {i} 异常", res)
+            """
             
             self.last_qihao = qihao
             
@@ -2427,6 +2529,8 @@ class PC28Bot:
 
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message))
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
+        # 添加消息检测器（检测开奖信息）
+        self.application.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, self.check_game_info_message))
         self.application.add_error_handler(self.error_handler)
 
     async def error_handler(self, update, context):
@@ -2814,6 +2918,30 @@ class PC28Bot:
             await target.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
         else:
             await target.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+    async def check_game_info_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """检测群消息中的开奖信息，收到后触发投注"""
+        user = update.effective_user.id
+        
+        # 获取消息文本和图片标题
+        message_text = update.message.text or ""
+        caption_text = update.message.caption or ""
+        full_text = message_text + " " + caption_text
+        
+        if not full_text.strip():
+            return
+        
+        # 遍历所有已登录且开启自动投注的账户
+        for phone, acc in self.account_manager.accounts.items():
+            if not acc.is_logged_in or not acc.auto_betting:
+                continue
+            
+            # 检查是否包含开奖信息（期号和封盘时间/开奖时间）
+            game_info = await self.game_scheduler.check_game_info_message(phone, full_text)
+            if game_info:
+                logger.log_betting(user, "在群消息中检测到开奖信息", f"账户:{phone} 期号:{game_info['qihao']}")
+                await self.game_scheduler.execute_bet_on_game_info(phone, game_info)
+                break  # 找到一个匹配的就够了，避免重复投注
 
     async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user.id
