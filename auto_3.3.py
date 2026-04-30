@@ -31,7 +31,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters, ConversationHandler
 )
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 # ==================== 配置 ====================
@@ -1751,6 +1751,7 @@ class GameScheduler:
         self.api = api_client
         self.game_stats = {'total_cycles':0, 'betting_cycles':0, 'successful_bets':0, 'failed_bets':0, 'total_profit':0, 'total_loss':0}
         self._last_game_info = None  # 存储最近检测到的开奖信息
+        self._listeners = {}  # 存储监听器，key: phone, value: handler
 
     async def start_auto_betting(self, phone, user_id):
         acc = self.account_manager.get_account(phone)
@@ -1762,12 +1763,89 @@ class GameScheduler:
             return False, "请先设置游戏群"
         await self.account_manager.update_account(phone, auto_betting=True, martingale_reset=True, fibonacci_reset=True)
         logger.log_betting(user_id, "自动投注开启", f"账户:{phone}")
+        # 开启自动投注时自动启动消息监听
+        await self.start_listening_for_game_info(phone)
         return True, "自动投注已开启"
 
     async def stop_auto_betting(self, phone, user_id):
         await self.account_manager.update_account(phone, auto_betting=False)
+        # 停止自动投注时停止消息监听
+        await self.stop_listening_for_game_info(phone)
         logger.log_betting(user_id, "自动投注关闭", f"账户:{phone}")
         return True, "自动投注已关闭"
+
+    async def start_listening_for_game_info(self, phone: str):
+        """启动 Telethon 客户端监听游戏群消息"""
+        client = self.account_manager.clients.get(phone)
+        acc = self.account_manager.get_account(phone)
+        
+        if not client:
+            logger.log_error(phone, "无法启动监听：客户端不存在", None)
+            return False
+        
+        if not acc:
+            logger.log_error(phone, "无法启动监听：账户不存在", None)
+            return False
+        
+        if not acc.game_group_id:
+            logger.log_error(phone, "无法启动监听：未设置游戏群", None)
+            return False
+        
+        # 检查是否已经在监听
+        if phone in self._listeners:
+            logger.log_system(f"账户 {phone} 已在监听中，跳过")
+            return True
+        
+        if not client.is_connected():
+            await client.connect()
+        
+        if not await client.is_user_authorized():
+            logger.log_error(phone, "无法启动监听：客户端未授权", None)
+            return False
+        
+        @client.on(events.NewMessage(chats=acc.game_group_id))
+        async def handler(event):
+            try:
+                # 避免处理自己发送的消息
+                if event.out:
+                    return
+                
+                message_text = event.message.text or ""
+                message_caption = event.message.caption or ""
+                full_text = message_text + " " + message_caption
+                
+                if not full_text.strip():
+                    return
+                
+                logger.log_betting(0, f"Telethon监听器收到群消息", f"账户:{phone} 群ID:{acc.game_group_id} 消息预览:{full_text[:100]}")
+                
+                # 检查是否包含开奖信息
+                game_info = await self.check_game_info_message(phone, full_text)
+                if game_info:
+                    logger.log_betting(0, "Telethon监听器检测到开奖信息", f"账户:{phone} 期号:{game_info['qihao']}")
+                    await self.execute_bet_on_game_info(phone, game_info)
+            except Exception as e:
+                logger.log_error(phone, f"处理群消息异常", e)
+        
+        # 保存监听器引用
+        self._listeners[phone] = handler
+        logger.log_system(f"已为账户 {phone} 启动开奖信息监听器（群ID:{acc.game_group_id}）")
+        return True
+
+    async def stop_listening_for_game_info(self, phone: str):
+        """停止 Telethon 客户端监听游戏群消息"""
+        if phone in self._listeners:
+            # Telethon 的 remove_event_handler 需要传入处理器
+            client = self.account_manager.clients.get(phone)
+            if client:
+                try:
+                    client.remove_event_handler(self._listeners[phone])
+                except Exception as e:
+                    logger.log_error(phone, f"移除事件处理器失败", e)
+            del self._listeners[phone]
+            logger.log_system(f"已停止账户 {phone} 的开奖信息监听器")
+            return True
+        return False
 
     async def check_game_info_message(self, phone: str, message_text: str) -> Optional[Dict]:
         """检测是否收到了开奖信息消息，如果是则提取期号并返回"""
@@ -1808,7 +1886,27 @@ class GameScheduler:
     async def execute_bet_on_game_info(self, phone: str, game_info: Dict):
         """检测到开奖信息后执行投注"""
         acc = self.account_manager.get_account(phone)
-        if not acc or not acc.auto_betting:
+        
+        # 添加详细日志
+        logger.log_betting(0, "开奖信息触发投注检查", 
+            f"账户:{phone} acc存在:{acc is not None} "
+            f"is_logged_in:{acc.is_logged_in if acc else 'N/A'} "
+            f"auto_betting:{acc.auto_betting if acc else 'N/A'} "
+            f"game_group_id:{acc.game_group_id if acc else 'N/A'}")
+        
+        if not acc:
+            logger.log_betting(0, "账户不存在，跳过", f"账户:{phone}")
+            return False
+        
+        if not acc.is_logged_in:
+            logger.log_betting(0, "账户未登录，跳过", f"账户:{phone}")
+            return False
+        
+        if not acc.game_group_id:
+            logger.log_betting(0, "未设置游戏群，跳过", f"账户:{phone}")
+            return False
+        
+        if not acc.auto_betting:
             logger.log_betting(0, "自动投注未开启，跳过", f"账户:{phone}")
             return False
         
@@ -2336,7 +2434,7 @@ class GlobalScheduler:
     async def _download_history_during_maintenance(self):
         try:
             logger.log_system("维护时段：开始下载历史数据...")
-            kj_url = f"https://www.pc28.ai/api/history/kj.csv?nbr=10000"
+            kj_url = f"https://www.pc28.help/api/history/kj.csv?nbr=10000"
             kj_rows = await self.api.download_csv_data(kj_url)
             logger.log_system("维护时段历史数据下载完成")
         except Exception as e: 
@@ -2529,8 +2627,6 @@ class PC28Bot:
 
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message))
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
-        # 添加消息检测器（检测开奖信息）
-        self.application.add_handler(MessageHandler(filters.TEXT | filters.CAPTION, self.check_game_info_message))
         self.application.add_error_handler(self.error_handler)
 
     async def error_handler(self, update, context):
@@ -2774,9 +2870,7 @@ class PC28Bot:
                     [InlineKeyboardButton("❌ 取消", callback_data=f"chase_cancel:{phone}")]
                 ])
             )
-            return Config.CHASE_PERIODS
-
-        periods = int(text)
+            return Config.CHASE_PERIODS        periods = int(text)
         context.user_data['chase_periods'] = periods
         phone = context.user_data['chase_phone']
 
@@ -2918,30 +3012,6 @@ class PC28Bot:
             await target.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
         else:
             await target.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-
-    async def check_game_info_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """检测群消息中的开奖信息，收到后触发投注"""
-        user = update.effective_user.id
-        
-        # 获取消息文本和图片标题
-        message_text = update.message.text or ""
-        caption_text = update.message.caption or ""
-        full_text = message_text + " " + caption_text
-        
-        if not full_text.strip():
-            return
-        
-        # 遍历所有已登录且开启自动投注的账户
-        for phone, acc in self.account_manager.accounts.items():
-            if not acc.is_logged_in or not acc.auto_betting:
-                continue
-            
-            # 检查是否包含开奖信息（期号和封盘时间/开奖时间）
-            game_info = await self.game_scheduler.check_game_info_message(phone, full_text)
-            if game_info:
-                logger.log_betting(user, "在群消息中检测到开奖信息", f"账户:{phone} 期号:{game_info['qihao']}")
-                await self.game_scheduler.execute_bet_on_game_info(phone, game_info)
-                break  # 找到一个匹配的就够了，避免重复投注
 
     async def handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user.id
@@ -3683,6 +3753,7 @@ class PC28Bot:
     async def _cmd_logout_inline(self, query, user, phone, context):
         await self.game_scheduler.stop_auto_betting(phone, user)
         await self.prediction_broadcaster.stop_broadcast(phone, user)
+        await self.game_scheduler.stop_listening_for_game_info(phone)
         client = self.account_manager.clients.get(phone)
         if client:
             try:
