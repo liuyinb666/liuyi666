@@ -2870,11 +2870,13 @@ class PC28Bot:
                     [InlineKeyboardButton("❌ 取消", callback_data=f"chase_cancel:{phone}")]
                 ])
             )
-            return Config.CHASE_PERIODS        periods = int(text)
+            return Config.CHASE_PERIODS
+
+        periods = int(text)
         context.user_data['chase_periods'] = periods
         phone = context.user_data['chase_phone']
 
-        text = (
+        text_str = (
             f"✅ 已设置期数：{periods} 期\n\n"
             "🔢 *第3步/共3步：请输入每注金额*\n\n"
             "请输入一个数字（单位根据您选择的币种）。\n"
@@ -2885,7 +2887,7 @@ class PC28Bot:
         reply_markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("❌ 取消", callback_data=f"chase_cancel:{phone}")]
         ])
-        await update.message.reply_text(text, reply_markup=reply_markup)
+        await update.message.reply_text(text_str, reply_markup=reply_markup, parse_mode='Markdown')
         return Config.CHASE_AMOUNT
 
     async def chase_input_amount(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2912,9 +2914,9 @@ class PC28Bot:
             )
             return Config.CHASE_AMOUNT
 
-        phone = context.user_data['chase_phone']
-        numbers = context.user_data['chase_numbers']
-        periods = context.user_data['chase_periods']
+        phone = context.user_data.get('chase_phone')
+        numbers = context.user_data.get('chase_numbers')
+        periods = context.user_data.get('chase_periods')
 
         await self.account_manager.update_account(
             phone,
@@ -2938,7 +2940,8 @@ class PC28Bot:
             f"📌 数字：{', '.join(map(str, numbers))}\n"
             f"📌 期数：{periods}\n"
             f"📌 每注金额：{amount if amount>0 else '使用基础金额'}{symbol}\n\n"
-            f"🔍 您可以在账户详情页查看追号状态。"
+            f"🔍 您可以在账户详情页查看追号状态。",
+            parse_mode='Markdown'
         )
 
         if acc:
