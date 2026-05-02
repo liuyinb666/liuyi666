@@ -1374,6 +1374,11 @@ class Account:
     prediction_content: str = "double"
     broadcast_stop_requested: bool = False
     betting_in_progress: bool = False
+    # 新增：用户自选杀组（固定杀某个组合）
+    user_manual_kill: Optional[str] = None
+    # 新增：连胜翻倍输了也翻倍策略的连胜连输计数
+    double_streak_wins: int = 0
+    double_streak_losses: int = 0
 
     def get_display_name(self) -> str:
         return self.display_name if self.display_name else self.phone
@@ -1410,7 +1415,8 @@ class AccountManager:
                                 'chase_current', 'chase_amount', 'chase_stop_reason', 'streak_records',
                                 'current_streak_type', 'current_streak_start', 'current_streak_messages',
                                 'current_streak_count', 'last_message_id', 'prediction_content',
-                                'broadcast_stop_requested', 'betting_in_progress']:
+                                'broadcast_stop_requested', 'betting_in_progress', 'user_manual_kill',
+                                'double_streak_wins', 'double_streak_losses']:
                         if key not in acc_dict:
                             if key == 'chase_numbers': acc_dict[key] = []
                             elif key == 'streak_records': acc_dict[key] = []
@@ -1429,6 +1435,9 @@ class AccountManager:
                             elif key == 'needs_2fa': acc_dict[key] = False
                             elif key == 'login_temp_data': acc_dict[key] = {}
                             elif key == 'current_streak_type': acc_dict[key] = None
+                            elif key == 'user_manual_kill': acc_dict[key] = None
+                            elif key == 'double_streak_wins': acc_dict[key] = 0
+                            elif key == 'double_streak_losses': acc_dict[key] = 0
                     self.accounts[phone] = Account(**acc_dict)
             except Exception as e:
                 logger.log_error(0, "加载账户数据失败", e)
@@ -1586,11 +1595,8 @@ class AccountManager:
                 if not connected:
                     logger.log_system(f"账户 {phone} 连接失效，已标记为未登录")
 
-    # 已禁用启动时重置自动投注标志
     async def reset_auto_flags_on_start(self):
-        # 不再重置任何自动标志
         logger.log_system("启动时保留账户的自动投注和播报标志（已禁用重置）")
-        # 可选：仅输出当前状态日志
         for phone, acc in self.accounts.items():
             if acc.auto_betting or acc.prediction_broadcast:
                 logger.log_system(f"账户 {phone} 当前状态: auto_betting={acc.auto_betting}, broadcast={acc.prediction_broadcast} (保留)")
@@ -1644,6 +1650,9 @@ class BettingStrategyManager:
             '斐波那契': {'description': '斐波那契策略', 'base_amount': 10000, 'max_amount': 10000000,
                         'multiplier': 1.0, 'stop_loss': 5000000, 'stop_win': 1000000,
                         'stop_balance': 500000, 'resume_balance': 2000000},
+            '连胜连输翻倍': {'description': '连胜翻倍输了也翻倍策略', 'base_amount': 10000, 'max_amount': 10000000,
+                             'multiplier': 2.0, 'stop_loss': 5000000, 'stop_win': 1000000,
+                             'stop_balance': 500000, 'resume_balance': 2000000},
         }
         self.schemes = {
             '组合1': '投注第1推荐组合',
@@ -1666,6 +1675,9 @@ class BettingStrategyManager:
                 'resume_balance': cfg.get('resume_balance', 100000),
             }
         )
+        # 重置连胜连输翻倍策略的计数器
+        if strategy_name == '连胜连输翻倍':
+            await self.account_manager.update_account(phone, double_streak_wins=0, double_streak_losses=0)
         logger.log_betting(user_id, "设置策略", f"账户:{phone} 策略:{strategy_name}")
         return True, f"已设置为: {strategy_name} 策略\n{cfg['description']}"
 
@@ -2029,12 +2041,24 @@ class GameScheduler:
             is_win = any(is_match(t, actual_combo) for t in last_bet_types)
         
         if is_win:
+            # 更新连胜连输翻倍策略的计数器
+            if acc.betting_strategy == '连胜连输翻倍':
+                await self.account_manager.update_account(phone,
+                    double_streak_wins=acc.double_streak_wins + 1,
+                    double_streak_losses=0
+                )
             await self.account_manager.update_account(phone,
                 consecutive_wins=acc.consecutive_wins+1, consecutive_losses=0,
                 martingale_reset=True, fibonacci_reset=True, total_wins=acc.total_wins+1
             )
             logger.log_betting(0, "投注命中", f"账户:{phone} 期号:{expected_qihao} 实际:{actual_combo} 方案:{scheme} 主推:{main} 候选:{candidate}")
         else:
+            # 更新连胜连输翻倍策略的计数器
+            if acc.betting_strategy == '连胜连输翻倍':
+                await self.account_manager.update_account(phone,
+                    double_streak_losses=acc.double_streak_losses + 1,
+                    double_streak_wins=0
+                )
             await self.account_manager.update_account(phone, consecutive_losses=acc.consecutive_losses+1, consecutive_wins=0)
             logger.log_betting(0, "投注未命中", f"账户:{phone} 期号:{expected_qihao} 实际:{actual_combo} 方案:{scheme} 主推:{main} 候选:{candidate}")
 
@@ -2107,18 +2131,22 @@ class GameScheduler:
             bet_amount, updates = self._calculate_bet_amount(acc, cur_bal)
             if updates: 
                 await self.account_manager.update_account(phone, **updates)
+            
+            # 获取最终的杀组：优先使用用户自选杀组，否则使用AI预测的杀组
+            final_kill = acc.user_manual_kill if acc.user_manual_kill else prediction.get('kill')
+            
             if acc.betting_scheme == '杀主':
-                kill_combo = prediction.get('kill')
-                if not kill_combo: 
-                    logger.log_betting(0, "AI未提供杀组，跳过投注", f"账户:{phone}")
+                if not final_kill:
+                    logger.log_betting(0, "无可用杀组（AI未提供且用户未设置），跳过投注", f"账户:{phone}")
                     return
-                bet_types = [c for c in COMBOS if c != kill_combo]
-                logger.log_betting(0, f"AI杀组: {kill_combo}, 投注组合: {bet_types}", f"账户:{phone}")
-            else: 
+                bet_types = [c for c in COMBOS if c != final_kill]
+                logger.log_betting(0, f"最终杀组: {final_kill}, 投注组合: {bet_types}", f"账户:{phone}")
+            else:
                 bet_types = self._get_bet_types(prediction, acc.betting_scheme)
+            
             bet_items = [f"{t} {bet_amount}" for t in bet_types]
             total = bet_amount * len(bet_types)
-            if cur_bal < total: 
+            if cur_bal < total:
                 logger.log_betting(0, "余额不足", f"账户:{phone} 余额:{cur_bal} 需要:{total}")
                 return
             success = await self._send_bets(phone, bet_items, is_chase=False)
@@ -2128,16 +2156,18 @@ class GameScheduler:
                 await self.account_manager.update_account(phone,
                     last_bet_time=datetime.now().isoformat(), last_bet_amount=bet_amount, last_bet_types=bet_types,
                     total_bets=acc.total_bets+1, last_bet_total=total,
-                    last_prediction={'main': prediction['main'], 'candidate': prediction['candidate'], 'confidence': prediction['confidence']},
+                    last_prediction={'main': prediction['main'], 'candidate': prediction['candidate'], 'confidence': prediction['confidence'], 'kill': final_kill},
                     last_bet_period=current_qihao)
                 logger.log_betting(0, "投注成功", f"账户:{phone} 每注金额:{bet_amount} 总金额:{total} 类型:{bet_types} 置信度:{prediction['confidence']:.1f}%")
                 asyncio.create_task(self._query_balance(phone))
-            else: 
+            else:
                 self.game_stats['failed_bets'] += 1
                 logger.log_betting(0, "投注失败", f"账户:{phone}")
         finally:
-            async with lock: 
-                acc.betting_in_progress = False
+            async with lock:
+                if phone in self.account_manager.accounts:
+                    acc = self.account_manager.accounts[phone]
+                    acc.betting_in_progress = False
 
     def _calculate_bet_amount(self, acc: Account, current_balance: float) -> Tuple[int, Dict]:
         if acc.bet_params.dynamic_base_ratio > 0 and current_balance > 0:
@@ -2168,6 +2198,14 @@ class GameScheduler:
                 amt = base * fib[idx]
         elif strategy == '激进': 
             amt = base * (1 + losses)
+        elif strategy == '连胜连输翻倍':
+            # 连胜翻倍输了也翻倍：无论输赢都翻倍，连胜次数和连输次数都参与计算
+            streak_count = max(acc.double_streak_wins, acc.double_streak_losses)
+            if streak_count == 0:
+                amt = base
+            else:
+                amt = base * (mult ** streak_count)
+            logger.log_betting(0, "连胜连输翻倍计算", f"账户:{acc.phone} 连胜:{acc.double_streak_wins} 连输:{acc.double_streak_losses} 倍数:{mult ** streak_count:.1f} 金额:{amt}")
         else: 
             amt = base
         amt = min(amt, max_amt)
@@ -2464,6 +2502,12 @@ class GlobalScheduler:
                     prediction = await self.model.predict(history, latest)
                     self._last_prediction_result = prediction
                     self._last_prediction_qihao = qihao
+            
+            # 为每个应用了自选杀组的账户，覆盖prediction中的kill
+            for phone, acc in self.account_manager.accounts.items():
+                if acc.user_manual_kill and acc.auto_betting:
+                    logger.log_betting(0, f"账户 {phone} 使用自选杀组覆盖AI杀组", f"原杀组={prediction.get('kill')} → 自选杀组={acc.user_manual_kill}")
+                    prediction['kill'] = acc.user_manual_kill
             
             next_qihao = increment_qihao(qihao)
             
@@ -2891,13 +2935,17 @@ class PC28Bot:
             pred_button = "⏳ 停止请求中"
 
         net_profit = acc.total_profit - acc.total_loss
+        
+        # 自选杀组状态显示
+        kill_status = f"当前杀组: {acc.user_manual_kill}" if acc.user_manual_kill else "未设置自选杀组"
 
         betting_menu = [
             [InlineKeyboardButton("🎯 投注方案", callback_data=f"action:setscheme:{phone}"),
              InlineKeyboardButton("📈 金额策略", callback_data=f"action:setstrategy:{phone}")],
             [InlineKeyboardButton("💰 设置金额", callback_data=f"amount_menu:{phone}"),
              InlineKeyboardButton("🔢 设置追号", callback_data=f"action:setchase:{phone}")],
-            [InlineKeyboardButton("💡 推荐金额", callback_data=f"recommend_amount:{phone}")],
+            [InlineKeyboardButton("💡 推荐金额", callback_data=f"recommend_amount:{phone}"),
+             InlineKeyboardButton("🎯 自选杀组", callback_data=f"action:setkill:{phone}")],
         ]
 
         content_type = "双组" if acc.prediction_content == "double" else "杀组"
@@ -2924,7 +2972,7 @@ class PC28Bot:
             status += f" | 🔢 追{acc.chase_current}/{acc.chase_periods}"
             kb.insert(4, [InlineKeyboardButton("🛑 停止追号", callback_data=f"action:stopchase:{phone}")])
 
-        text = f"📱 *账户: {display}*\n\n状态: {status}\n净盈利: {net_profit:.0f}K\n\n选择操作:"
+        text = f"📱 *账户: {display}*\n\n状态: {status}\n净盈利: {net_profit:.0f}K\n{kill_status}\n\n选择操作:"
         return text, InlineKeyboardMarkup(kb)
 
     async def _show_account_detail(self, target, user, phone, context):
@@ -3106,6 +3154,14 @@ class PC28Bot:
             ratio_str = parts[1]
             phone = parts[2]
             await self._set_dynamic_ratio(query, user, phone, ratio_str, context)
+        elif data.startswith("set_kill:"):
+            parts = data.split(":")
+            kill_combo = parts[1]
+            phone = parts[2]
+            await self._process_set_kill(query, user, phone, kill_combo)
+        elif data.startswith("clear_kill:"):
+            phone = data.split(":")[1]
+            await self._process_clear_kill(query, user, phone)
         else:
             logger.log_error(user, "未知回调", data)
 
@@ -3264,8 +3320,62 @@ class PC28Bot:
                 chase_amount=0
             )
             await self._show_account_detail(query, user, phone, context)
+        elif action == "setkill":
+            await self._show_kill_selection(query, phone)
         else:
             await query.edit_message_text("❌ 未知操作", parse_mode='Markdown')
+
+    async def _show_kill_selection(self, query, phone):
+        """显示自选杀组选择菜单"""
+        acc = self.account_manager.get_account(phone)
+        if not acc:
+            await query.edit_message_text("❌ 账户不存在")
+            return
+        
+        current_kill = acc.user_manual_kill
+        status = f"当前自选杀组: {current_kill}" if current_kill else "当前未设置自选杀组（使用AI自动杀组）"
+        
+        text = f"""
+🎯 *自选杀组设置*
+
+{status}
+
+选择您要一直杀的组合（投注时会排除该组合，始终不投）：
+• 小单
+• 小双
+• 大单
+• 大双
+
+点击下方按钮设置自选杀组，设置后自动投注时会始终排除该组合。
+如需恢复使用AI自动杀组，请点击"清除自选杀组"。
+        """
+        kb = [
+            [InlineKeyboardButton("🔴 小单", callback_data=f"set_kill:小单:{phone}"),
+             InlineKeyboardButton("🟢 小双", callback_data=f"set_kill:小双:{phone}")],
+            [InlineKeyboardButton("🔵 大单", callback_data=f"set_kill:大单:{phone}"),
+             InlineKeyboardButton("🟡 大双", callback_data=f"set_kill:大双:{phone}")],
+            [InlineKeyboardButton("🗑️ 清除自选杀组", callback_data=f"clear_kill:{phone}")],
+            [InlineKeyboardButton("🔙 返回账户详情", callback_data=f"select_account:{phone}")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    async def _process_set_kill(self, query, user, phone, kill_combo):
+        """处理设置自选杀组"""
+        if kill_combo not in COMBOS:
+            await query.edit_message_text("❌ 无效的组合")
+            return
+        
+        await self.account_manager.update_account(phone, user_manual_kill=kill_combo)
+        logger.log_betting(user, "设置自选杀组", f"账户:{phone} 杀组:{kill_combo}")
+        await query.edit_message_text(f"✅ 已设置自选杀组: {kill_combo}\n\n自动投注时将始终排除此组合。")
+        await self._show_account_detail(query, user, phone, None)
+
+    async def _process_clear_kill(self, query, user, phone):
+        """清除自选杀组，恢复使用AI自动杀组"""
+        await self.account_manager.update_account(phone, user_manual_kill=None)
+        logger.log_betting(user, "清除自选杀组", f"账户:{phone}")
+        await query.edit_message_text("✅ 已清除自选杀组，将恢复使用AI自动杀组")
+        await self._show_account_detail(query, user, phone, None)
 
     async def _list_groups_for_selection(self, query, phone):
         client = self.account_manager.clients.get(phone)
@@ -3406,6 +3516,7 @@ class PC28Bot:
 • 止损: {params.stop_loss}KK
 • 止盈: {params.stop_win}KK
 • 恢复余额: {params.resume_balance}KK
+• 自选杀组: {acc.user_manual_kill if acc.user_manual_kill else '未设置（使用AI）'}
 """
         if acc.chase_enabled:
             status += f"""
@@ -3555,6 +3666,7 @@ class PC28Bot:
 • 设置群组：进入账户详情，点击“💬 游戏群”或“📢 播报群”，从列表中选择。
 • 投注设置：在“投注设置”区域选择方案、策略、金额、追号。
 • 播报设置：在“播报设置”区域选择播报群和播报内容（双组/杀组）。
+• 自选杀组：在“投注设置”区域点击“🎯 自选杀组”，选择您想永远排除的组合。
 • 自动投注/播报：点击相应按钮即可开启/关闭（播报停止会等待最后一期开奖）。
 • 查询余额/账户状态：点击相应按钮。
 • 手动投注：在游戏群发送“类型 金额”即可，如“大 10000”。
@@ -3564,6 +3676,16 @@ class PC28Bot:
 • 双杀组算法：Y值位差和 + 和值运算对立算法，双算法一致确定杀组
 • 双Y融合：3Y顺序取尾数 + 双权重打分（尾数和40% + 走势频次60%）
 • 硅基流动AI辅助验证：AI验证规则结果的合理性
+
+*金额策略说明*
+• 保守/平衡/激进：固定倍率，只输翻倍
+• 马丁格尔：输后翻倍，赢后重置
+• 斐波那契：输后按斐波那契数列递增
+• 连胜连输翻倍：无论输赢都翻倍（连胜翻倍输了也翻倍）
+
+*自选杀组功能*
+如果您想固定排除某个组合（例如您认为某个组合近期不会出），可以使用此功能。
+设置后，无论AI预测结果如何，系统都会始终排除您选择的组合。
 
 如有问题，请联系管理员。
         """
@@ -3631,7 +3753,10 @@ class PC28Bot:
             chase_numbers=[],
             chase_periods=0,
             chase_current=0,
-            chase_amount=0
+            chase_amount=0,
+            user_manual_kill=None,
+            double_streak_wins=0,
+            double_streak_losses=0
         )
         self.account_manager.set_user_state(user, 'idle', {'current_account': None})
         await self._show_account_detail(query, user, phone, context)
