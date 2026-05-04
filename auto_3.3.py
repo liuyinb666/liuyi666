@@ -2031,7 +2031,7 @@ class GameScheduler:
     logger.log_betting(user_id, "跟随投注开启", f"账户:{phone} 将检测到@kk28的✅ 投注成功")
     return True, "跟随投注已开启，将检测到@kk28发送的✅ 投注成功后自动跟投"
 
-async def stop_follow_betting(self, phone: str, user_id: int) -> Tuple[bool, str]:
+    async def stop_follow_betting(self, phone: str, user_id: int) -> Tuple[bool, str]:
     """关闭跟随投注模式"""
     await self.account_manager.update_account(phone, follow_betting_enabled=False)
     
@@ -2041,7 +2041,7 @@ async def stop_follow_betting(self, phone: str, user_id: int) -> Tuple[bool, str
     logger.log_betting(user_id, "跟随投注关闭", f"账户:{phone}")
     return True, "跟随投注已关闭"
 
-async def _follow_listen_loop(self, phone: str, group_id: int):
+    async def _follow_listen_loop(self, phone: str, group_id: int):
     """监听群消息的循环 - 检测@kk28发送的'✅ 投注成功'"""
     client = self.account_manager.clients.get(phone)
     if not client:
@@ -2121,7 +2121,7 @@ async def _follow_listen_loop(self, phone: str, group_id: int):
     if phone in self.follow_listener_tasks:
         del self.follow_listener_tasks[phone]
 
-async def _execute_follow_bet(self, phone: str, current_qihao: Optional[str]):
+    async def _execute_follow_bet(self, phone: str, current_qihao: Optional[str]):
     """执行跟随投注"""
     acc = self.account_manager.get_account(phone)
     if not acc or not acc.follow_betting_enabled:
