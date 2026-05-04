@@ -32,7 +32,7 @@ from telethon.errors import SessionPasswordNeededError, FloodWaitError
 # ==================== 配置 ====================
 class Config:
     BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
-    API_ID = int(os.environ.get('API_ID', ))
+    API_ID = int(os.environ.get('API_ID', 0))
     API_HASH = os.environ.get('API_HASH', '')
     PC28_API_BASE = "https://www.pc28.help/api/kj.json?nbr=200"
     ADMIN_USER_IDS = [7673012566]
@@ -132,11 +132,13 @@ class ColoredFormatter(logging.Formatter):
         logging.ERROR: red + "%(asctime)s [%(levelname)s] %(message)s" + reset,
         'BETTING': green + "%(asctime)s [投注] %(message)s" + reset,
         'PREDICTION': blue + "%(asctime)s [预测] %(message)s" + reset,
+        'LISTEN': yellow + "%(asctime)s [监听] %(message)s" + reset,
     }
 
     def format(self, record):
         if hasattr(record, 'betting') and record.betting: self._style._fmt = self.FORMATS['BETTING']
         elif hasattr(record, 'prediction') and record.prediction: self._style._fmt = self.FORMATS['PREDICTION']
+        elif hasattr(record, 'listen') and record.listen: self._style._fmt = self.FORMATS['LISTEN']
         else: self._style._fmt = self.FORMATS.get(record.levelno, self.grey + "%(asctime)s [%(levelname)s] %(message)s" + self.reset)
         return super().format(record)
 
@@ -172,6 +174,8 @@ class BotLogger:
         extra = {'betting': True}; self.logger.info(f"用户:{user_id} {action} {detail}", extra=extra)
     def log_prediction(self, user_id, action, detail):
         extra = {'prediction': True}; self.logger.info(f"用户:{user_id} {action} {detail}", extra=extra)
+    def log_listen(self, user_id, action, detail):
+        extra = {'listen': True}; self.logger.info(f"用户:{user_id} {action} {detail}", extra=extra)
     def log_analysis(self, msg): self.logger.debug(f"[分析] {msg}")
     def log_error(self, user_id, action, error):
         error_trace = traceback.format_exc(); self.logger.error(f"[错误] 用户:{user_id} {action}: {error}\n{error_trace}")
@@ -208,9 +212,9 @@ class PC28RulePredictor:
         
         # 3Y池取数顺序映射
         self.order_3y_map = {
-            0: ['3Y0', '3Y1', '3Y2'],  # 3Y0池A球 → 3Y1池B球 → 3Y2池C球
-            1: ['3Y1', '3Y2', '3Y0'],  # 3Y1池A球 → 3Y2池B球 → 3Y0池C球
-            2: ['3Y2', '3Y0', '3Y1'],  # 3Y2池A球 → 3Y0池B球 → 3Y1池C球
+            0: ['3Y0', '3Y1', '3Y2'],
+            1: ['3Y1', '3Y2', '3Y0'],
+            2: ['3Y2', '3Y0', '3Y1'],
         }
         
         # 5Y特码池
@@ -233,45 +237,25 @@ class PC28RulePredictor:
         self.high_freq_combos = ["小单", "小双", "大双"]
     
     def _calc_y_value(self, a: int, b: int, c: int, total: int) -> int:
-        """
-        计算Y值：拼接数各位数字和
-        公式：拼接数 = A球B球C球（三位数），新数 = 拼接数 + 和值，Y = 新数各位数字和
-        """
         concat_num = a * 100 + b * 10 + c
         new_num = concat_num + total
         return sum(int(d) for d in str(new_num))
     
     def _calc_3y(self, total: int) -> int:
-        """计算3Y：和值对3取余"""
         return total % 3
     
     def _calc_5y(self, total: int) -> int:
-        """计算5Y：和值对5取余"""
         return total % 5
     
     def _calc_kill_by_sub_algo1(self, latest: Dict, history_10: List[Dict]) -> Optional[str]:
-        """
-        子算法1：calcKillGroup
-        基于Y值和位差和判定杀组
-        
-        步骤：
-        1. 拼接数生成：A1B1C1
-        2. 新数 = 拼接数 + H1，计算Y1
-        3. 在历史中找首个Y1一致的历史期
-        4. 计算位差和 S = |A1-A2| + |B1-B2| + |C1-C2|
-        5. S<14为小，S≥14为大；S奇数单，S偶数双 → 临时组合Z2
-        6. Z2即为杀组
-        """
         try:
             a1 = latest.get('a', 0)
             b1 = latest.get('b', 0)
             c1 = latest.get('c', 0)
             h1 = latest.get('sum', 0)
             
-            # 计算Y1
             y1 = self._calc_y_value(a1, b1, c1, h1)
             
-            # 在历史中找首个Y值一致的历史期
             target_idx = -1
             for i, h in enumerate(history_10):
                 if h.get('y_value') == y1:
@@ -286,10 +270,8 @@ class PC28RulePredictor:
             b2 = target.get('b', 0)
             c2 = target.get('c', 0)
             
-            # 计算位差和
             s = abs(a1 - a2) + abs(b1 - b2) + abs(c1 - c2)
             
-            # 判定临时组合
             size = "小" if s < 14 else "大"
             parity = "单" if s % 2 == 1 else "双"
             
@@ -299,37 +281,22 @@ class PC28RulePredictor:
             return None
     
     def _calc_kill_by_sub_algo2(self, latest: Dict) -> Optional[str]:
-        """
-        子算法2：calculateKillType
-        基于和值运算判定杀组（返回对立组合）
-        
-        步骤：
-        1. step1 = H1 × 3 × H1，取step1后三位数字（不足三位补0）
-        2. 计算该三位数各位数字和 D2
-        3. S = D2 + A1，若S>27则S=S-27
-        4. 由S判定临时组合Z3
-        5. 返回Z3的对立组合作为杀组
-        """
         try:
             h1 = latest.get('sum', 0)
             a1 = latest.get('a', 0)
             
-            # step1 = H1 × 3 × H1
             step1_raw = h1 * 3 * h1
             step1_str = str(step1_raw)[-3:].zfill(3)
             d2 = sum(int(d) for d in step1_str)
             
-            # 修正值S
             s = d2 + a1
             if s > 27:
                 s = s - 27
             
-            # 判定临时组合
             size = "小" if s < 14 else "大"
             parity = "单" if s % 2 == 1 else "双"
             temp_combo = size + parity
             
-            # 返回对立组合作为杀组
             opposite_size = self.size_map[size]
             opposite_parity = self.parity_map[parity]
             return opposite_size + opposite_parity
@@ -338,21 +305,13 @@ class PC28RulePredictor:
             return None
     
     def get_rule_based_kill(self, latest: Dict, history_10: List[Dict]) -> Tuple[Optional[str], int]:
-        """
-        获取基于双算法一致性的杀组
-        
-        规则：子算法1与子算法2杀组结果完全一致时采用，否则采用子算法2
-        返回：(杀组, 置信度)
-        """
         kill1 = self._calc_kill_by_sub_algo1(latest, history_10)
         kill2 = self._calc_kill_by_sub_algo2(latest)
         
         if kill1 and kill2 and kill1 == kill2:
-            # 双算法一致，高置信度
             logger.log_analysis(f"双算法杀组一致: {kill1}")
             return kill1, 90
         elif kill2:
-            # 不一致时采用子算法2
             logger.log_analysis(f"杀组不一致: 算法1={kill1}, 算法2={kill2}, 采用算法2")
             return kill2, 70
         elif kill1:
@@ -360,22 +319,11 @@ class PC28RulePredictor:
         return None, 0
     
     def _calculate_tail_numbers(self, history_10: List[Dict], latest: Dict) -> Tuple[List[int], str]:
-        """
-        双Y融合算法 - 尾数计算
-        
-        步骤：
-        1. 根据最新期和值的3Y确定顺序
-        2. 按顺序从对应3Y池取最新3期的对应球数据
-        3. 分别求和后取个位数尾数
-        4. 尾数和H2判定基础组合Z4
-        """
         h1 = latest.get('sum', 0)
         y3 = self._calc_3y(h1)
         
-        # 获取顺序
         order = self.order_3y_map.get(y3, ['3Y0', '3Y1', '3Y2'])
         
-        # 构建3Y池
         pools_3y = {'3Y0': [], '3Y1': [], '3Y2': []}
         for h in history_10[:10]:
             total = h.get('sum', 0)
@@ -383,7 +331,6 @@ class PC28RulePredictor:
             pool_key = f'3Y{y3_val}'
             pools_3y[pool_key].append(h)
         
-        # 球索引映射
         ball_map = {'3Y0': 'a', '3Y1': 'b', '3Y2': 'c'}
         
         tail_sums = []
@@ -392,18 +339,14 @@ class PC28RulePredictor:
             ball = ball_map.get(pool_key, 'a')
             
             if len(pool) >= 3:
-                # 取最新3期（索引0,1,2）
                 values = [h.get(ball, 0) for h in pool[:3]]
                 tail_sum = sum(values) % 10
             else:
-                # 数据不足时使用默认值
                 tail_sum = 0
             tail_sums.append(tail_sum)
         
-        # 尾数和
         h2 = sum(tail_sums) % 10
         
-        # 判定基础组合
         base_size = "小" if h2 < 14 else "大"
         base_parity = "单" if h2 % 2 == 1 else "双"
         base_combo = base_size + base_parity
@@ -411,16 +354,6 @@ class PC28RulePredictor:
         return tail_sums, base_combo
     
     def _calculate_scores(self, history_10: List[Dict], base_combo: str, rule_kill: str) -> Dict[str, Dict]:
-        """
-        双权重打分系统
-        
-        权重分配：
-        - 尾数和判定权重（40%）：基础组合40分，关联组合30分，非关联10分
-        - 近期走势频次权重（60%）：≥3次60分，1-2次40分，0次10分；高频防组合+10分
-        
-        返回：{组合: {'score': 总分, 'tail_score': 尾数分, 'freq_score': 频次分}}
-        """
-        # 统计近10期频次
         combo_count = {c: 0 for c in self.combos}
         for h in history_10[:10]:
             combo = h.get('combo', '')
@@ -433,7 +366,6 @@ class PC28RulePredictor:
                 scores[combo] = {'score': 0, 'tail_score': 0, 'freq_score': 0, 'is_kill': True}
                 continue
             
-            # 尾数和判定分（40%）
             if combo == base_combo:
                 tail_score = 40
             elif combo[0] == base_combo[0] or combo[1] == base_combo[1]:
@@ -441,7 +373,6 @@ class PC28RulePredictor:
             else:
                 tail_score = 10
             
-            # 近期走势频次分（60%）
             count = combo_count.get(combo, 0)
             if count >= 3:
                 freq_score = 60
@@ -450,7 +381,6 @@ class PC28RulePredictor:
             else:
                 freq_score = 10
             
-            # 高频防组合加权
             if combo in self.high_freq_combos:
                 freq_score += 10
             
@@ -467,58 +397,36 @@ class PC28RulePredictor:
         return scores
     
     def get_rule_based_predictions(self, history_10: List[Dict]) -> Dict:
-        """
-        完整的基于规则的预测（文件2核心算法）
-        
-        返回格式：
-        {
-            'main': [主推1, 主推2],      # 核心主攻组合（2个）
-            'candidate': 稳防组合,       # 高概率稳防组合（1个）
-            'kill': 杀组,                # 最终杀组
-            'kill_confidence': 置信度,   # 杀组置信度
-            'confidence': 总置信度,      # 预测总置信度
-            'special_numbers': [4个特码], # 核心特码
-            'jump_risk': 跳开提示,
-            'algo_details': 算法详情
-        }
-        """
         if len(history_10) < 10:
             logger.log_analysis(f"历史数据不足10期，当前{len(history_10)}期")
             return None
         
         latest = history_10[0]
         
-        # 为每条历史记录计算Y值（供子算法1使用）
         for h in history_10:
             if 'y_value' not in h and h.get('a') is not None:
                 h['y_value'] = self._calc_y_value(
                     h.get('a', 0), h.get('b', 0), h.get('c', 0), h.get('sum', 0)
                 )
         
-        # 模块1：双杀组算法
         rule_kill, kill_conf = self.get_rule_based_kill(latest, history_10)
         if not rule_kill:
             logger.log_analysis("杀组计算失败，使用默认杀组")
             rule_kill = random.choice(self.combos)
             kill_conf = 50
         
-        # 模块2：双Y融合组合预测
         tail_sums, base_combo = self._calculate_tail_numbers(history_10, latest)
         
-        # 双权重打分
         scores = self._calculate_scores(history_10, base_combo, rule_kill)
         
-        # 按分数排序，排除杀组
         sorted_combos = sorted(
             [(c, data) for c, data in scores.items() if not data.get('is_kill')],
             key=lambda x: x[1]['score'],
             reverse=True
         )
         
-        # 三层组合分级
-        main_combos = []      # 核心主攻（总分≥90）
-        candidate_combo = None  # 高概率稳防（80-89）
-        fallback_combo = None    # 兜底防（<80，实际就是杀组）
+        main_combos = []
+        candidate_combo = None
         
         for combo, data in sorted_combos:
             score = data['score']
@@ -527,17 +435,14 @@ class PC28RulePredictor:
             elif 80 <= score < 90 and candidate_combo is None:
                 candidate_combo = combo
         
-        # 如果主攻不足2个，从稳防中补充
         if len(main_combos) < 2 and candidate_combo:
             main_combos.append(candidate_combo)
             candidate_combo = None
         
-        # 如果还不够，从剩余中取最高分
         for combo, data in sorted_combos:
             if combo not in main_combos and combo != candidate_combo and len(main_combos) < 2:
                 main_combos.append(combo)
         
-        # 模块3：5Y+3Y融合特码推导
         h1 = latest.get('sum', 0)
         y5 = self._calc_5y(h1)
         y3 = self._calc_3y(h1)
@@ -545,16 +450,13 @@ class PC28RulePredictor:
         pool_5y = self.pool_5y.get(y5, [0, 5, 10, 15, 20, 25])
         pool_3y = self.pool_3y.get(y3, [])
         
-        # 取交集
         intersection = [n for n in pool_5y if n in pool_3y]
         
-        # 统计近10期和值频次
         sum_count = Counter()
         for h in history_10[:10]:
             s = h.get('sum', 0)
             sum_count[s] += 1
         
-        # 从5Y池按频次补充
         remaining = []
         for num in pool_5y:
             if num not in intersection:
@@ -567,14 +469,11 @@ class PC28RulePredictor:
                 break
             special_numbers.append(num)
         
-        # 确保输出4个
         while len(special_numbers) < 4:
             special_numbers.append(random.randint(0, 27))
         
-        # 模块4：跳开提示
         jump_risk = f"双算法一致判定杀[{rule_kill}]，{rule_kill}近期无连续走势/和值支撑回补，极低等级跳开风险；核心圈（{','.join(main_combos)}）全覆盖近期高概率开出方向"
         
-        # 计算总置信度
         main_scores = [scores.get(c, {}).get('score', 0) for c in main_combos]
         avg_main_score = sum(main_scores) / len(main_scores) if main_scores else 0
         confidence = min(95, int(avg_main_score * 0.8 + kill_conf * 0.2))
@@ -602,13 +501,8 @@ class PC28RulePredictor:
         
         return result
 
-# ==================== 硅基流动AI客户端（使用规则生成提示词） ====================
+# ==================== 硅基流动AI客户端 ====================
 class SiliconFlowAIClient:
-    """
-    硅基流动AI客户端
-    使用文件2的规则计算结果来生成提示词，让AI进行推理验证
-    """
-    
     def __init__(self, api_key=None, model_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"):
         self.api_url = "https://api.siliconflow.cn/v1/chat/completions"
         self.api_key = api_key or Config.SILICONFLOW_API_KEY
@@ -620,27 +514,19 @@ class SiliconFlowAIClient:
         self._last_qihao = None
         self._last_prompt_hash = None
         
-        # 初始化规则预测器
         self.rule_predictor = PC28RulePredictor()
     
     def _build_rule_based_prompt(self, history: List[Dict], rule_result: Dict) -> str:
-        """
-        基于规则预测结果构建AI提示词
-        让AI在规则结果的基础上进行推理验证
-        """
         if not rule_result:
             return self._build_fallback_prompt(history)
         
-        # 提取历史走势
         combos_10 = [h.get('combo', '') for h in history[:10] if h.get('combo')]
         sums_10 = [h.get('sum', 0) for h in history[:10] if h.get('sum') is not None]
         
-        # 计算走势统计
         combo_count = Counter(combos_10)
         size_trend = [c[0] for c in combos_10 if c]
         parity_trend = [c[1] for c in combos_10 if c]
         
-        # 连开分析
         current_streak = 1
         if combos_10:
             for i in range(1, len(combos_10)):
@@ -690,7 +576,6 @@ class SiliconFlowAIClient:
         return prompt
     
     def _build_fallback_prompt(self, history: List[Dict]) -> str:
-        """备用提示词（规则预测失败时使用）"""
         combos_10 = [h.get('combo', '') for h in history[:10] if h.get('combo')]
         sums_10 = [h.get('sum', 0) for h in history[:10] if h.get('sum') is not None]
         
@@ -716,16 +601,15 @@ class SiliconFlowAIClient:
         return prompt
     
     def _parse_ai_response(self, text: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
-        """解析AI响应"""
         try:
             start = text.find('{')
-            end = text.rfind('}') + 1            if start == -1 or end == 0:
+            end = text.rfind('}') + 1
+            if start == -1 or end == 0:
                 return None, None, None, None
             
             json_str = text[start:end]
             data = json.loads(json_str)
             
-            # 尝试多种字段名
             main = data.get("main") or data.get("main_confirm")
             candidate = data.get("candidate") or data.get("candidate_confirm")
             kill = data.get("kill") or data.get("kill_confirm")
@@ -749,12 +633,6 @@ class SiliconFlowAIClient:
             return None, None, None, None
     
     async def predict(self, history: List[Dict], qihao: str = None) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
-        """
-        全局预测方法
-        1. 先用规则算法计算基础预测
-        2. 让AI基于规则结果进行验证和微调
-        3. 最终输出验证后的结果
-        """
         if qihao and self._last_qihao == qihao and self._last_prediction:
             logger.log_api("使用缓存的预测结果", f"期号: {qihao}")
             return self._last_prediction
@@ -763,25 +641,20 @@ class SiliconFlowAIClient:
             if qihao and self._last_qihao == qihao and self._last_prediction:
                 return self._last_prediction
             
-            # 步骤1：用规则算法计算基础预测
             rule_predictor = PC28RulePredictor()
             rule_result = rule_predictor.get_rule_based_predictions(list(history)[:10])
             
             if rule_result:
                 logger.log_analysis(f"规则算法计算结果: 主推{rule_result['main']}, 杀组{rule_result['kill']}")
                 
-                # 步骤2：构建基于规则结果的提示词
                 prompt = self._build_rule_based_prompt(history, rule_result)
                 
-                # 步骤3：调用AI进行验证
                 ai_result = await self._call_ai_with_prompt(prompt, qihao, history)
                 
                 if ai_result[0] is not None:
-                    # AI验证通过，使用AI结果
                     logger.log_prediction(0, "AI验证规则结果", f"AI确认: 主推{ai_result[0]}, 杀组{ai_result[2]}")
                     return ai_result
                 else:
-                    # AI验证失败，使用规则结果
                     main = rule_result['main'][0] if rule_result['main'] else rule_result['candidate']
                     candidate = rule_result['candidate'] if rule_result['candidate'] else rule_result['main'][-1] if rule_result['main'] else COMBOS[0]
                     kill = rule_result['kill']
@@ -789,13 +662,11 @@ class SiliconFlowAIClient:
                     logger.log_analysis(f"AI验证失败，使用规则结果: 主推{main}, 候选{candidate}, 杀组{kill}")
                     return main, candidate, kill, confidence
             else:
-                # 规则计算失败，回退到纯AI预测
                 logger.log_analysis("规则计算失败，回退到纯AI预测")
                 prompt = self._build_fallback_prompt(history)
                 return await self._call_ai_with_prompt(prompt, qihao, history)
     
     async def _call_ai_with_prompt(self, prompt: str, qihao: str, history: List[Dict]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
-        """调用AI API"""
         prompt_hash = hashlib.md5(prompt.encode()).hexdigest()
         
         if prompt_hash in self._active_requests:
@@ -831,7 +702,6 @@ class SiliconFlowAIClient:
                 del self._active_requests[prompt_hash]
     
     async def _do_predict(self, payload: Dict, prompt_hash: str, history: List[Dict]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
-        """实际执行AI调用"""
         max_retries = 3
         base_delay = 2
         
@@ -872,7 +742,6 @@ class SiliconFlowAIClient:
         return self._get_fallback_from_rule(history)
     
     def _get_fallback_from_rule(self, history: List[Dict]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
-        """从规则算法获取备用结果"""
         rule_predictor = PC28RulePredictor()
         rule_result = rule_predictor.get_rule_based_predictions(list(history)[:10])
         
@@ -883,7 +752,6 @@ class SiliconFlowAIClient:
             confidence = rule_result['confidence']
             return main, candidate, kill, confidence
         
-        # 最终回退：基于历史频次
         combos_20 = [h['combo'] for h in history[:20] if h.get('combo')]
         if combos_20:
             freq = Counter(combos_20)
@@ -913,7 +781,6 @@ class ModelManager:
         self._last_predict_result = None
         self._last_predict_qihao = None
         
-        # 规则预测器（用于缓存和对比）
         self.rule_predictor = PC28RulePredictor()
 
     async def save(self):
@@ -929,7 +796,6 @@ class ModelManager:
                 logger.log_error(0, "保存预测历史失败", e)
 
     async def predict(self, history: List[Dict], latest: Dict = None) -> Dict:
-        """预测方法 - 使用规则+AI混合模式"""
         qihao = latest.get('qihao') if latest else None
         
         if qihao and self._last_predict_qihao == qihao and self._last_predict_result:
@@ -940,12 +806,9 @@ class ModelManager:
             if qihao and self._last_predict_qihao == qihao and self._last_predict_result:
                 return self._last_predict_result
 
-            # 调用AI客户端（内部会使用规则算法）
             main, candidate, kill, confidence = await self.ai_client.predict(list(history), qihao)
             
-            # 兜底处理
             if main is None:
-                # 使用规则算法兜底
                 rule_result = self.rule_predictor.get_rule_based_predictions(list(history)[:10])
                 if rule_result:
                     main = rule_result['main'][0] if rule_result['main'] else rule_result['candidate']
@@ -959,7 +822,6 @@ class ModelManager:
                     confidence = 50
                 logger.log_analysis("使用规则算法兜底")
             
-            # 确保三者互不相同
             if main == candidate:
                 candidate = random.choice([c for c in COMBOS if c != main])
             if main == kill or candidate == kill:
@@ -1375,11 +1237,16 @@ class Account:
     betting_in_progress: bool = False
     # 自选杀组
     user_manual_kill: Optional[str] = None
-    # 新策略专用：连胜连输翻倍（第3把开始翻倍，输无上限）
-    streak_win_count: int = 0      # 当前连胜次数
-    streak_loss_count: int = 0     # 当前连输次数
-    # 跟随投注模式
-    follow_betting_enabled: bool = False   # 是否启用跟随投注（检测@kk28投注成功后再投注）
+    # 新策略专用：连胜连输翻倍
+    streak_win_count: int = 0
+    streak_loss_count: int = 0
+    # ========== 新增：监听模式相关字段 ==========
+    listening_enabled: bool = False          # 是否启用监听模式
+    listen_group_id: int = 0                 # 监听的群组ID
+    listen_group_name: str = ""              # 监听群组名称
+    listen_delay_seconds: int = 1            # 监听到消息后延迟投注的秒数
+    listen_keywords: List[str] = field(default_factory=lambda: ["✅ 投注成功", "投注成功", "@kk28"])
+    listen_last_trigger: Optional[str] = None  # 上次触发时间，用于防止重复触发
 
     def get_display_name(self) -> str:
         return self.display_name if self.display_name else self.phone
@@ -1417,12 +1284,20 @@ class AccountManager:
                                 'current_streak_type', 'current_streak_start', 'current_streak_messages',
                                 'current_streak_count', 'last_message_id', 'prediction_content',
                                 'broadcast_stop_requested', 'betting_in_progress', 'user_manual_kill',
-                                'streak_win_count', 'streak_loss_count', 'follow_betting_enabled']:
+                                'streak_win_count', 'streak_loss_count',
+                                'listening_enabled', 'listen_group_id', 'listen_group_name', 
+                                'listen_delay_seconds', 'listen_keywords']:
                         if key not in acc_dict:
                             if key == 'chase_numbers': acc_dict[key] = []
                             elif key == 'streak_records': acc_dict[key] = []
-                            elif key == 'current_streak_start': acc_dict[key] = None
                             elif key == 'current_streak_messages': acc_dict[key] = []
+                            elif key == 'listen_keywords': acc_dict[key] = ["✅ 投注成功", "投注成功", "@kk28"]
+                            elif key == 'listen_group_id': acc_dict[key] = 0
+                            elif key == 'listen_delay_seconds': acc_dict[key] = 1
+                            elif key == 'listen_group_name': acc_dict[key] = ""
+                            elif key == 'listening_enabled': acc_dict[key] = False
+                            elif key == 'listen_last_trigger': acc_dict[key] = None
+                            elif key == 'current_streak_start': acc_dict[key] = None
                             elif key == 'current_streak_count': acc_dict[key] = 0
                             elif key == 'last_message_id': acc_dict[key] = None
                             elif key == 'prediction_content': acc_dict[key] = "double"
@@ -1439,7 +1314,6 @@ class AccountManager:
                             elif key == 'user_manual_kill': acc_dict[key] = None
                             elif key == 'streak_win_count': acc_dict[key] = 0
                             elif key == 'streak_loss_count': acc_dict[key] = 0
-                            elif key == 'follow_betting_enabled': acc_dict[key] = False
                     self.accounts[phone] = Account(**acc_dict)
             except Exception as e:
                 logger.log_error(0, "加载账户数据失败", e)
@@ -1561,23 +1435,23 @@ class AccountManager:
         client = self.clients.get(phone)
         if not client:
             logger.log_error(0, f"客户端不存在 {phone}", None)
-            await self.update_account(phone, is_logged_in=False, auto_betting=False, prediction_broadcast=False)
+            await self.update_account(phone, is_logged_in=False, auto_betting=False, prediction_broadcast=False, listening_enabled=False)
             return False
         if not client.is_connected():
             try:
                 await client.connect()
             except Exception as e:
                 logger.log_error(0, f"重连客户端失败 {phone}", e)
-                await self.update_account(phone, is_logged_in=False, auto_betting=False, prediction_broadcast=False)
+                await self.update_account(phone, is_logged_in=False, auto_betting=False, prediction_broadcast=False, listening_enabled=False)
                 return False
         try:
             if not await client.is_user_authorized():
                 logger.log_error(0, f"客户端 {phone} 会话未授权", None)
-                await self.update_account(phone, is_logged_in=False, auto_betting=False, prediction_broadcast=False)
+                await self.update_account(phone, is_logged_in=False, auto_betting=False, prediction_broadcast=False, listening_enabled=False)
                 return False
         except Exception as e:
             logger.log_error(0, f"检查授权失败 {phone}", e)
-            await self.update_account(phone, is_logged_in=False, auto_betting=False, prediction_broadcast=False)
+            await self.update_account(phone, is_logged_in=False, auto_betting=False, prediction_broadcast=False, listening_enabled=False)
             return False
         return True
 
@@ -1600,8 +1474,8 @@ class AccountManager:
     async def reset_auto_flags_on_start(self):
         logger.log_system("启动时保留账户的自动投注和播报标志（已禁用重置）")
         for phone, acc in self.accounts.items():
-            if acc.auto_betting or acc.prediction_broadcast:
-                logger.log_system(f"账户 {phone} 当前状态: auto_betting={acc.auto_betting}, broadcast={acc.prediction_broadcast} (保留)")
+            if acc.auto_betting or acc.prediction_broadcast or acc.listening_enabled:
+                logger.log_system(f"账户 {phone} 当前状态: auto_betting={acc.auto_betting}, broadcast={acc.prediction_broadcast}, listening={acc.listening_enabled} (保留)")
 
     async def start_periodic_save(self):
         self._save_task = asyncio.create_task(self._periodic_save())
@@ -1654,7 +1528,7 @@ class BettingStrategyManager:
                         'stop_balance': 500000, 'resume_balance': 2000000},
             '连胜连输翻倍': {'description': '第3把开始翻倍 | 输无上限', 'base_amount': 10000, 'max_amount': 10000000,
                              'multiplier': 2.0, 'stop_loss': 5000000, 'stop_win': 1000000,
-                             'stop_balance': 500000, 'resume_balance': 2000000},
+                             'stop_balance': 500000, 'resume_balance': 1000000},
         }
         self.schemes = {
             '组合1': '投注第1推荐组合',
@@ -1677,7 +1551,6 @@ class BettingStrategyManager:
                 'resume_balance': cfg.get('resume_balance', 100000),
             }
         )
-        # 重置连胜连输翻倍策略的计数器
         if strategy_name == '连胜连输翻倍':
             await self.account_manager.update_account(phone, streak_win_count=0, streak_loss_count=0)
         logger.log_betting(user_id, "设置策略", f"账户:{phone} 策略:{strategy_name}")
@@ -1980,6 +1853,230 @@ class PredictionBroadcaster:
                     return None
             return None
 
+# ==================== 投注监听器模块（新增） ====================
+class BetListener:
+    """
+    监听群组中其他用户的投注成功消息，然后触发自己的投注
+    支持的关键词：✅ 投注成功、投注成功、@kk28
+    """
+    
+    def __init__(self, account_manager, game_scheduler, api_client, model_manager):
+        self.account_manager = account_manager
+        self.game_scheduler = game_scheduler
+        self.api = api_client
+        self.model = model_manager
+        self.listening_tasks = {}  # phone -> task
+        self._listening = {}  # phone -> bool
+        self._last_trigger_time = {}  # phone -> datetime 用于防抖
+        
+    async def start_listening(self, phone: str, user_id: int) -> Tuple[bool, str]:
+        """开始监听群组中的投注成功消息"""
+        acc = self.account_manager.get_account(phone)
+        if not acc:
+            return False, "账户不存在"
+        if not acc.is_logged_in:
+            return False, "请先登录账户"
+        if not acc.listen_group_id:
+            return False, "请先设置监听群组"
+        
+        if phone in self.listening_tasks and not self.listening_tasks[phone].done():
+            return True, "监听器已在运行"
+        
+        if phone in self.listening_tasks:
+            self.listening_tasks[phone].cancel()
+        
+        self._listening[phone] = True
+        self._last_trigger_time[phone] = None
+        task = asyncio.create_task(self._listen_loop(phone))
+        self.listening_tasks[phone] = task
+        
+        await self.account_manager.update_account(phone, listening_enabled=True)
+        logger.log_listen(user_id, "监听器启动", f"账户:{phone} 群组ID:{acc.listen_group_id}")
+        return True, f"投注监听器启动成功\n监听群组: {acc.listen_group_name or acc.listen_group_id}\n关键词: {', '.join(acc.listen_keywords)}"
+    
+    async def stop_listening(self, phone: str, user_id: int) -> Tuple[bool, str]:
+        """停止监听"""
+        self._listening[phone] = False
+        if phone in self.listening_tasks and not self.listening_tasks[phone].done():
+            self.listening_tasks[phone].cancel()
+        await self.account_manager.update_account(phone, listening_enabled=False)
+        logger.log_listen(user_id, "监听器停止", f"账户:{phone}")
+        return True, "投注监听器已停止"
+    
+    async def set_listen_group(self, phone: str, group_id: int, group_name: str, user_id: int) -> Tuple[bool, str]:
+        """设置监听群组"""
+        await self.account_manager.update_account(phone, listen_group_id=group_id, listen_group_name=group_name)
+        logger.log_listen(user_id, "设置监听群组", f"账户:{phone} 群组:{group_name}({group_id})")
+        return True, f"监听群组已设置为: {group_name}"
+    
+    async def set_listen_keywords(self, phone: str, keywords: List[str], user_id: int) -> Tuple[bool, str]:
+        """设置监听关键词"""
+        await self.account_manager.update_account(phone, listen_keywords=keywords)
+        logger.log_listen(user_id, "设置监听关键词", f"账户:{phone} 关键词:{keywords}")
+        return True, f"监听关键词已设置为: {', '.join(keywords)}"
+    
+    async def _listen_loop(self, phone: str):
+        """监听循环"""
+        client = self.account_manager.clients.get(phone)
+        if not client:
+            logger.log_error(0, f"监听器无法获取客户端 {phone}", None)
+            return
+        
+        last_message_id = 0
+        error_count = 0
+        
+        # 获取最后一条消息ID作为起点
+        try:
+            messages = await client.get_messages(self.account_manager.accounts[phone].listen_group_id, limit=1)
+            if messages:
+                last_message_id = messages[0].id
+        except Exception as e:
+            logger.log_error(0, f"获取起始消息ID失败 {phone}", e)
+        
+        while self._listening.get(phone, False):
+            try:
+                acc = self.account_manager.get_account(phone)
+                if not acc:
+                    break
+                
+                if not await self.account_manager.ensure_client_connected(phone):
+                    logger.log_error(0, f"监听器客户端断开 {phone}", None)
+                    break
+                
+                group_id = acc.listen_group_id
+                if not group_id:
+                    break
+                
+                # 获取最近的消息
+                messages = await client.get_messages(group_id, limit=10)
+                
+                for msg in messages:
+                    # 跳过自己发送的消息
+                    if msg.out:
+                        continue
+                    
+                    # 检查是否是已处理过的消息
+                    if msg.id <= last_message_id:
+                        continue
+                    
+                    # 检查是否包含投注成功关键词
+                    if msg.text and self._is_bet_success_message(msg.text, acc.listen_keywords):
+                        logger.log_listen(0, f"检测到投注成功消息", 
+                                        f"账户:{phone} 消息ID:{msg.id} 内容:{msg.text[:100]}")
+                        
+                        # 防抖：同一账户5秒内只触发一次
+                        now = datetime.now()
+                        last_trigger = self._last_trigger_time.get(phone)
+                        if last_trigger and (now - last_trigger).total_seconds() < acc.listen_delay_seconds:
+                            logger.log_listen(0, f"防抖跳过", f"账户:{phone} 上次触发间隔过短")
+                            last_message_id = msg.id
+                            continue
+                        
+                        self._last_trigger_time[phone] = now
+                        
+                        # 延迟后触发投注
+                        if acc.listen_delay_seconds > 0:
+                            await asyncio.sleep(acc.listen_delay_seconds)
+                        
+                        # 检查是否还在监听状态
+                        if not self._listening.get(phone, False):
+                            break
+                        
+                        # 触发投注
+                        asyncio.create_task(self._trigger_bet(phone, msg))
+                        
+                        # 更新最后处理的消息ID
+                        if msg.id > last_message_id:
+                            last_message_id = msg.id
+                    else:
+                        # 即使不是投注成功消息，也更新最后消息ID，避免重复处理
+                        if msg.id > last_message_id:
+                            last_message_id = msg.id
+                
+                error_count = 0
+                await asyncio.sleep(2)  # 每2秒检查一次
+                
+            except asyncio.CancelledError:
+                break
+            except FloodWaitError as e:
+                logger.log_listen(0, f"监听触发限流，等待 {e.seconds} 秒", f"账户:{phone}")
+                await asyncio.sleep(min(e.seconds, 30))
+            except Exception as e:
+                error_count += 1
+                logger.log_error(0, f"监听循环异常 {phone}", e)
+                if error_count >= 5:
+                    break
+                await asyncio.sleep(10)
+        
+        self._listening[phone] = False
+        await self.account_manager.update_account(phone, listening_enabled=False)
+    
+    def _is_bet_success_message(self, text: str, keywords: List[str]) -> bool:
+        """判断消息是否为投注成功消息"""
+        if not text:
+            return False
+        text_lower = text.lower()
+        
+        # 检查自定义关键词
+        for kw in keywords:
+            if kw.lower() in text_lower:
+                return True
+        
+        # 检查投注成功模式：包含 ✅ 和 投注成功
+        if "✅" in text and ("投注成功" in text or "bet success" in text_lower):
+            return True
+        
+        # 检查是否有金额和投注类型模式
+        bet_pattern = r'[大小单双]+[单双]?\s*[-－]\s*\d+\s*[USDT|KK|元|U]'
+        if re.search(bet_pattern, text) and "成功" in text:
+            return True
+        
+        # 检查是否有 @kk28 或类似模式
+        if "@kk28" in text_lower or "@kkpay" in text_lower:
+            return True
+        
+        return False
+    
+    async def _trigger_bet(self, phone: str, trigger_message):
+        """触发投注"""
+        acc = self.account_manager.get_account(phone)
+        if not acc:
+            return
+        
+        if not acc.auto_betting:
+            logger.log_listen(0, f"账户 {phone} 未开启自动投注，跳过", "")
+            return
+        
+        # 防止重复触发
+        if acc.betting_in_progress:
+            logger.log_listen(0, f"账户 {phone} 正在投注中，跳过", "")
+            return
+        
+        # 获取最新开奖数据
+        latest = await self.api.get_latest_result()
+        if not latest:
+            logger.log_listen(0, f"无法获取最新开奖数据", f"账户:{phone}")
+            return
+        
+        # 获取历史数据用于预测
+        history = await self.api.get_history(50)
+        if len(history) < 3:
+            logger.log_listen(0, f"历史数据不足，跳过投注", f"账户:{phone}")
+            return
+        
+        # 获取预测结果
+        prediction = await self.model.predict(history, latest)
+        
+        # 如果有自选杀组，覆盖AI杀组
+        if acc.user_manual_kill:
+            prediction['kill'] = acc.user_manual_kill
+            logger.log_listen(0, f"使用自选杀组覆盖", f"账户:{phone} 杀组={acc.user_manual_kill}")
+        
+        logger.log_listen(0, f"监听触发投注", f"账户:{phone} 预测主推:{prediction['main']} 杀组:{prediction['kill']}")
+        
+        # 执行投注
+        await self.game_scheduler.execute_bet(phone, prediction, latest)
+
 # ==================== 游戏调度器 ====================
 class GameScheduler:
     def __init__(self, account_manager, model_manager, api_client):
@@ -1987,7 +2084,6 @@ class GameScheduler:
         self.model = model_manager
         self.api = api_client
         self.game_stats = {'total_cycles':0, 'betting_cycles':0, 'successful_bets':0, 'failed_bets':0, 'total_profit':0, 'total_loss':0}
-        self.follow_listener_tasks: Dict[str, asyncio.Task] = {}
 
     async def start_auto_betting(self, phone, user_id):
         acc = self.account_manager.get_account(phone)
@@ -2005,200 +2101,6 @@ class GameScheduler:
         await self.account_manager.update_account(phone, auto_betting=False)
         logger.log_betting(user_id, "自动投注关闭", f"账户:{phone}")
         return True, "自动投注已关闭"
-
-    async def start_follow_betting(self, phone: str, user_id: int) -> Tuple[bool, str]:
-        """开启跟随投注模式 - 检测到@kk28投注成功后才投注"""
-        acc = self.account_manager.get_account(phone)
-        if not acc:
-            return False, "账户不存在"
-        if not acc.is_logged_in:
-            return False, "请先登录账户"
-        if not acc.game_group_id:
-            return False, "请先设置游戏群"
-        
-        if phone in self.follow_listener_tasks and not self.follow_listener_tasks[phone].done():
-            self.follow_listener_tasks[phone].cancel()
-        
-        await self.account_manager.update_account(phone, follow_betting_enabled=True)
-        
-        self.follow_listener_tasks[phone] = asyncio.create_task(
-            self._follow_listen_loop(phone, acc.game_group_id)
-        )
-        
-        logger.log_betting(user_id, "跟随投注开启", f"账户:{phone} 将检测到@kk28的✅ 投注成功")
-        return True, "跟随投注已开启，将检测到@kk28发送的✅ 投注成功后自动跟投"
-    
-    async def stop_follow_betting(self, phone: str, user_id: int) -> Tuple[bool, str]:
-        """关闭跟随投注模式"""
-        await self.account_manager.update_account(phone, follow_betting_enabled=False)
-        
-        if phone in self.follow_listener_tasks and not self.follow_listener_tasks[phone].done():
-            self.follow_listener_tasks[phone].cancel()
-        
-        logger.log_betting(user_id, "跟随投注关闭", f"账户:{phone}")
-        return True, "跟随投注已关闭"
-    
-    async def _follow_listen_loop(self, phone: str, group_id: int):
-        """监听群消息的循环 - 检测@kk28发送的'✅ 投注成功'"""
-        client = self.account_manager.clients.get(phone)
-        if not client:
-            logger.log_error(0, f"跟随监听启动失败 {phone}", "客户端不存在")
-            return
-        
-        error_count = 0
-        last_message_id = 0
-        
-        logger.log_system(f"跟随监听器已启动: {phone} 监听群组 {group_id}，目标: @kk28 发送的 ✅ 投注成功")
-        
-        while True:
-            try:
-                acc = self.account_manager.get_account(phone)
-                if not acc or not acc.follow_betting_enabled:
-                    logger.log_system(f"跟随监听器已停止: {phone}")
-                    break
-                
-                if not await self.account_manager.ensure_client_connected(phone):
-                    await asyncio.sleep(5)
-                    continue
-                
-                try:
-                    messages = await client.get_messages(group_id, limit=10, min_id=last_message_id)
-                except Exception as e:
-                    logger.log_error(phone, "获取群消息失败", e)
-                    await asyncio.sleep(5)
-                    continue
-                
-                for msg in messages:
-                    if msg.text and msg.id > last_message_id:
-                        last_message_id = msg.id
-                        
-                        try:
-                            sender = await client.get_entity(msg.sender_id)
-                            sender_username = getattr(sender, 'username', '')
-                            
-                            if sender_username == 'kk28' and "✅ 投注成功" in msg.text:
-                                logger.log_betting(0, "检测到@kk28投注成功", 
-                                    f"账户:{phone} 消息:{msg.text[:100]}")
-                                
-                                latest = await self.api.get_latest_result()
-                                current_qihao = latest.get('qihao') if latest else None
-                                
-                                acc = self.account_manager.get_account(phone)
-                                if acc.last_bet_period == current_qihao:
-                                    logger.log_betting(0, "本期已投注，跳过", f"账户:{phone} 期号:{current_qihao}")
-                                    continue
-                                
-                                await self._execute_follow_bet(phone, current_qihao)
-                        except Exception as e:
-                            logger.log_error(phone, f"获取发送者信息失败", e)
-                            continue
-                
-                await asyncio.sleep(2)
-                error_count = 0
-                
-            except asyncio.CancelledError:
-                logger.log_system(f"跟随监听器任务被取消: {phone}")
-                break
-            except Exception as e:
-                error_count += 1
-                logger.log_error(phone, f"跟随监听循环异常", e)
-                if error_count >= 10:
-                    logger.log_error(phone, "跟随监听器错误过多，停止", e)
-                    await self.account_manager.update_account(phone, follow_betting_enabled=False)
-                    break
-                await asyncio.sleep(10)
-        
-        if phone in self.follow_listener_tasks:
-            del self.follow_listener_tasks[phone]
-    
-    async def _execute_follow_bet(self, phone: str, current_qihao: Optional[str]):
-        """执行跟随投注"""
-        acc = self.account_manager.get_account(phone)
-        if not acc or not acc.follow_betting_enabled:
-            return
-        
-        lock = self.account_manager.account_locks.setdefault(phone, asyncio.Lock())
-        async with lock:
-            if acc.betting_in_progress:
-                logger.log_betting(0, "账户投注正在进行中，跳过本次跟随投注", f"账户:{phone}")
-                return
-            await self.account_manager.update_account(phone, betting_in_progress=True)
-        
-        try:
-            history = await self.api.get_history(50)
-            latest = await self.api.get_latest_result()
-            
-            if len(history) < 3:
-                logger.log_betting(0, "历史数据不足，跳过跟随投注", f"账户:{phone}")
-                return
-            
-            prediction = await self.model.predict(history, latest)
-            
-            final_kill = acc.user_manual_kill if acc.user_manual_kill else prediction.get('kill')
-            
-            cur_bal = await self._query_balance(phone)
-            if cur_bal is None or cur_bal <= 0:
-                logger.log_betting(0, "获取余额失败或余额不足", f"账户:{phone}")
-                return
-            
-            bet_amount, updates = self._calculate_bet_amount(acc, cur_bal)
-            if updates:
-                await self.account_manager.update_account(phone, **updates)
-            
-            bet_amount = min(bet_amount, acc.bet_params.max_amount)
-            bet_amount = max(bet_amount, Config.MIN_BET_AMOUNT)
-            
-            if acc.betting_scheme == '杀主':
-                if not final_kill:
-                    logger.log_betting(0, "无可用杀组，跳过跟随投注", f"账户:{phone}")
-                    return
-                bet_types = [c for c in COMBOS if c != final_kill]
-                logger.log_betting(0, f"跟随投注 - 最终杀组: {final_kill}, 投注组合: {bet_types}", f"账户:{phone}")
-            else:
-                bet_types = self._get_bet_types(prediction, acc.betting_scheme)
-            
-            total = bet_amount * len(bet_types)
-            if cur_bal < total:
-                logger.log_betting(0, "跟随投注余额不足", f"账户:{phone} 余额:{cur_bal} 需要:{total}")
-                return
-            
-            bet_items = [f"{t} {bet_amount}" for t in bet_types]
-            logger.log_betting(0, f"跟随投注发送: {bet_items}", f"账户:{phone}")
-            
-            success = await self._send_bets(phone, bet_items, is_chase=False)
-            
-            if success:
-                self.game_stats['successful_bets'] += 1
-                self.game_stats['betting_cycles'] += 1
-                await self.account_manager.update_account(phone,
-                    last_bet_time=datetime.now().isoformat(),
-                    last_bet_amount=bet_amount,
-                    last_bet_types=bet_types,
-                    total_bets=acc.total_bets + 1,
-                    last_bet_total=total,
-                    last_prediction={
-                        'main': prediction['main'],
-                        'candidate': prediction['candidate'],
-                        'confidence': prediction['confidence'],
-                        'kill': final_kill
-                    },
-                    last_bet_period=current_qihao
-                )
-                logger.log_betting(0, "跟随投注成功", 
-                    f"账户:{phone} 每注金额:{bet_amount} 总金额:{total} 类型:{bet_types} 期号:{current_qihao}")
-                
-                asyncio.create_task(self._query_balance(phone))
-            else:
-                self.game_stats['failed_bets'] += 1
-                logger.log_betting(0, "跟随投注发送失败", f"账户:{phone}")
-                
-        except Exception as e:
-            logger.log_error(phone, "跟随投注执行异常", e)
-        finally:
-            async with lock:
-                acc = self.account_manager.get_account(phone)
-                if acc:
-                    acc.betting_in_progress = False
 
     async def check_bet_result(self, phone, expected_qihao, latest_result):
         acc = self.account_manager.get_account(phone)
@@ -2298,11 +2200,6 @@ class GameScheduler:
         acc = self.account_manager.get_account(phone)
         if not acc: 
             return
-        
-        if acc.follow_betting_enabled:
-            logger.log_betting(0, "跟随投注模式已开启，自动投注被禁用，等待检测到@kk28的✅ 投注成功", f"账户:{phone}")
-            return
-        
         lock = self.account_manager.account_locks.setdefault(phone, asyncio.Lock())
         async with lock:
             if acc.betting_in_progress:
@@ -2575,7 +2472,8 @@ class GameScheduler:
     def get_stats(self):
         auto = sum(1 for a in self.account_manager.accounts.values() if a.auto_betting)
         broadcast = sum(1 for a in self.account_manager.accounts.values() if a.prediction_broadcast)
-        return {'auto_betting_accounts': auto, 'broadcast_accounts': broadcast, 'game_stats': self.game_stats.copy()}
+        listen = sum(1 for a in self.account_manager.accounts.values() if a.listening_enabled)
+        return {'auto_betting_accounts': auto, 'broadcast_accounts': broadcast, 'listening_accounts': listen, 'game_stats': self.game_stats.copy()}
 
 # ==================== 全局调度器 ====================
 class GlobalScheduler:
@@ -2759,11 +2657,13 @@ class PC28Bot:
             None, self.game_scheduler
         )
         self.prediction_broadcaster = PredictionBroadcaster(self.account_manager, self.model, self.api, self.global_scheduler)
+        # 新增：投注监听器
+        self.bet_listener = BetListener(self.account_manager, self.game_scheduler, self.api, self.model)
         self.global_scheduler.prediction_broadcaster = self.prediction_broadcaster
 
         self.application = Application.builder().token(Config.BOT_TOKEN).build()
         self._register_handlers()
-        logger.log_system("PC28 Bot（规则+AI混合版 - 基于文件2双杀组+双Y融合算法）初始化完成")
+        logger.log_system("PC28 Bot（规则+AI混合版 - 新增监听模式）初始化完成")
 
     def _register_handlers(self):
         self.application.add_handler(CommandHandler("start", self.cmd_start))
@@ -2825,7 +2725,8 @@ class PC28Bot:
         await update.message.reply_text(
             "🎰 *PC28 智能预测投注系统*\n\n"
             "✨ 欢迎使用！基于双杀组+双Y融合算法\n"
-            "🤖 硅基流动AI辅助验证\n\n"
+            "🤖 硅基流动AI辅助验证\n"
+            "🔍 新增监听模式：监听到群组投注成功后自动投注\n\n"
             "请选择操作：",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
@@ -3135,21 +3036,23 @@ class PC28Bot:
             status += " | 🤖 自动投注"
         if acc.prediction_broadcast: 
             status += " | 📊 播报中"
+        if acc.listening_enabled:
+            status += " | 🔍 监听中"
         if acc.broadcast_stop_requested: 
             status += " | ⏳ 停止中"
-        if acc.follow_betting_enabled:
-            status += " | 🔍 跟随投注"
 
         bet_button = "🛑 停止自动投注" if acc.auto_betting else "🤖 开启自动投注"
         pred_button = "🛑 停止播报" if acc.prediction_broadcast else "📊 开启播报"
+        listen_button = "🛑 停止监听" if acc.listening_enabled else "🔍 开启监听"
         if acc.broadcast_stop_requested:
             pred_button = "⏳ 停止请求中"
-        
-        follow_button = "🛑 停止跟随" if acc.follow_betting_enabled else "🔍 开启跟随投注"
 
         net_profit = acc.total_profit - acc.total_loss
         
         kill_status = f"当前杀组: {acc.user_manual_kill}" if acc.user_manual_kill else "未设置自选杀组"
+        
+        # 监听群组显示
+        listen_group_status = f"监听群组: {acc.listen_group_name or '未设置'}" if acc.listen_group_id else "监听群组: 未设置"
 
         betting_menu = [
             [InlineKeyboardButton("🎯 投注方案", callback_data=f"action:setscheme:{phone}"),
@@ -3165,15 +3068,21 @@ class PC28Bot:
             [InlineKeyboardButton("📢 播报群", callback_data=f"action:listpredgroups:{phone}"),
              InlineKeyboardButton(f"🎛️ 播报内容({content_type})", callback_data=f"toggle_content:{phone}")],
         ]
+        
+        # 监听菜单
+        listen_menu = [
+            [InlineKeyboardButton("🔍 监听群组", callback_data=f"action:list_listen_groups:{phone}"),
+             InlineKeyboardButton("⚙️ 监听设置", callback_data=f"action:listen_settings:{phone}")],
+        ]
 
         kb = [
             [InlineKeyboardButton("🔐 登录", callback_data=f"login_select:{phone}"),
              InlineKeyboardButton("🚪 登出", callback_data=f"action:logout:{phone}")],
             [InlineKeyboardButton("💬 游戏群", callback_data=f"action:listgroups:{phone}")],
-        ] + betting_menu + broadcast_menu + [
+        ] + betting_menu + broadcast_menu + listen_menu + [
             [InlineKeyboardButton(bet_button, callback_data=f"action:toggle_bet:{phone}"),
-             InlineKeyboardButton(pred_button, callback_data=f"action:toggle_pred:{phone}")],
-            [InlineKeyboardButton(follow_button, callback_data=f"action:toggle_follow:{phone}")],
+             InlineKeyboardButton(pred_button, callback_data=f"action:toggle_pred:{phone}"),
+             InlineKeyboardButton(listen_button, callback_data=f"action:toggle_listen:{phone}")],
             [InlineKeyboardButton("💰 查询余额", callback_data=f"action:balance:{phone}"),
              InlineKeyboardButton("📊 账户状态", callback_data=f"action:status:{phone}")],
             [InlineKeyboardButton("📊 连输连赢记录", callback_data=f"action:streak:{phone}"),
@@ -3185,7 +3094,7 @@ class PC28Bot:
             status += f" | 🔢 追{acc.chase_current}/{acc.chase_periods}"
             kb.insert(4, [InlineKeyboardButton("🛑 停止追号", callback_data=f"action:stopchase:{phone}")])
 
-        text = f"📱 *账户: {display}*\n\n状态: {status}\n净盈利: {net_profit:.0f}K\n{kill_status}\n\n选择操作:"
+        text = f"📱 *账户: {display}*\n\n状态: {status}\n净盈利: {net_profit:.0f}K\n{kill_status}\n{listen_group_status}\n\n选择操作:"
         return text, InlineKeyboardMarkup(kb)
 
     async def _show_account_detail(self, target, user, phone, context):
@@ -3329,10 +3238,13 @@ class PC28Bot:
                 await self._process_set_scheme(query, user, phone, scheme)
         elif data.startswith("set_group:"):
             group_id = int(data.split(":")[1])
-            await self._set_group_callback(query, user, group_id)
+            await self._set_game_group_callback(query, user, group_id)
         elif data.startswith("set_pred_group:"):
             group_id = int(data.split(":")[1])
             await self._set_pred_group_callback(query, user, group_id)
+        elif data.startswith("set_listen_group:"):
+            group_id = int(data.split(":")[1])
+            await self._set_listen_group_callback(query, user, group_id)
         elif data.startswith("toggle_content:"):
             phone = data.split(":")[1]
             await self._toggle_prediction_content(query, user, phone)
@@ -3418,7 +3330,7 @@ class PC28Bot:
             [InlineKeyboardButton("❓ 帮助", callback_data="menu:help")],
             [InlineKeyboardButton("📖 使用手册", url=Config.MANUAL_LINK)]
         ]
-        text = "🎮 *PC28 智能投注系统*\n\n基于双杀组+双Y融合算法 | AI辅助验证\n\n请选择操作："
+        text = "🎮 *PC28 智能投注系统*\n\n基于双杀组+双Y融合算法 | AI辅助验证 | 监听模式\n\n请选择操作："
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _show_accounts_menu(self, query, user):
@@ -3484,12 +3396,15 @@ class PC28Bot:
             else:
                 await self.prediction_broadcaster.start_broadcast(phone, user)
             await self._show_account_detail(query, user, phone, context)
-        elif action == "toggle_follow":
+        elif action == "toggle_listen":
             acc = self.account_manager.get_account(phone)
-            if acc.follow_betting_enabled:
-                await self.game_scheduler.stop_follow_betting(phone, user)
+            if acc.listening_enabled:
+                await self.bet_listener.stop_listening(phone, user)
             else:
-                await self.game_scheduler.start_follow_betting(phone, user)
+                if not acc.listen_group_id:
+                    await self._show_listen_group_selection(query, phone)
+                    return
+                await self.bet_listener.start_listening(phone, user)
             await self._show_account_detail(query, user, phone, context)
         elif action == "balance":
             cached = self.account_manager.get_cached_balance(phone)
@@ -3513,9 +3428,13 @@ class PC28Bot:
         elif action == "setscheme":
             await self._show_scheme_selection(query, phone)
         elif action == "listgroups":
-            await self._list_groups_for_selection(query, phone)
+            await self._list_games_groups_for_selection(query, phone)
         elif action == "listpredgroups":
-            await self._list_groups_for_prediction(query, phone)
+            await self._list_pred_groups_for_selection(query, phone)
+        elif action == "list_listen_groups":
+            await self._list_listen_groups_for_selection(query, phone)
+        elif action == "listen_settings":
+            await self._show_listen_settings_menu(query, phone)
         elif action == "manual_bet_help":
             text = """
 📚 *手动投注说明*
@@ -3594,7 +3513,7 @@ class PC28Bot:
         await query.edit_message_text("✅ 已清除自选杀组，将恢复使用AI自动杀组")
         await self._show_account_detail(query, user, phone, None)
 
-    async def _list_groups_for_selection(self, query, phone):
+    async def _list_games_groups_for_selection(self, query, phone):
         client = self.account_manager.clients.get(phone)
         if not client:
             await query.edit_message_text("❌ 客户端未连接", parse_mode='Markdown')
@@ -3617,7 +3536,7 @@ class PC28Bot:
             kb = [[InlineKeyboardButton("🔙 返回", callback_data=f"select_account:{phone}")]]
             await query.edit_message_text("❌ 获取群组列表失败", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
-    async def _list_groups_for_prediction(self, query, phone):
+    async def _list_pred_groups_for_selection(self, query, phone):
         client = self.account_manager.clients.get(phone)
         if not client:
             await query.edit_message_text("❌ 客户端未连接", parse_mode='Markdown')
@@ -3640,7 +3559,77 @@ class PC28Bot:
             kb = [[InlineKeyboardButton("🔙 返回", callback_data=f"select_account:{phone}")]]
             await query.edit_message_text("❌ 获取群组列表失败", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
-    async def _set_group_callback(self, query, user, group_id):
+    async def _list_listen_groups_for_selection(self, query, phone):
+        """选择监听群组"""
+        client = self.account_manager.clients.get(phone)
+        if not client:
+            await query.edit_message_text("❌ 客户端未连接", parse_mode='Markdown')
+            return
+        try:
+            dialogs = await client.get_dialogs(limit=30)
+            groups = [d for d in dialogs if d.is_group or d.is_channel]
+            if not groups:
+                kb = [[InlineKeyboardButton("🔙 返回", callback_data=f"select_account:{phone}")]]
+                await query.edit_message_text("📭 未找到任何群组", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+                return
+            kb = []
+            for g in groups[:15]:
+                icon = "📢" if g.is_channel else "👥"
+                kb.append([InlineKeyboardButton(f"{icon} {g.name[:35]}", callback_data=f"set_listen_group:{g.id}")])
+            kb.append([InlineKeyboardButton("🔙 返回", callback_data=f"select_account:{phone}")])
+            await query.edit_message_text("🔍 *选择监听群组*\n\n选择要监听的群组，当群内有投注成功消息时自动触发投注：", 
+                                         reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        except Exception as e:
+            logger.log_error(0, f"获取群组列表失败 {phone}", e)
+            kb = [[InlineKeyboardButton("🔙 返回", callback_data=f"select_account:{phone}")]]
+            await query.edit_message_text("❌ 获取群组列表失败", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    async def _show_listen_settings_menu(self, query, phone):
+        """显示监听设置菜单"""
+        acc = self.account_manager.get_account(phone)
+        if not acc:
+            await query.edit_message_text("❌ 账户不存在")
+            return
+        
+        text = f"""
+🔍 *监听设置 - {acc.get_display_name()}*
+
+当前设置：
+• 监听群组: {acc.listen_group_name or '未设置'} (ID: {acc.listen_group_id or '无'})
+• 触发延迟: {acc.listen_delay_seconds} 秒
+• 监听关键词: {', '.join(acc.listen_keywords)}
+
+监听说明：
+当监听的群组中出现投注成功消息时，系统会自动执行投注。
+支持的关键词：✅ 投注成功、投注成功、@kk28 以及自定义金额模式。
+
+选择要修改的设置：
+        """
+        kb = [
+            [InlineKeyboardButton("🎯 设置监听群组", callback_data=f"action:list_listen_groups:{phone}")],
+            [InlineKeyboardButton("⏱️ 设置触发延迟", callback_data=f"action:set_listen_delay:{phone}")],
+            [InlineKeyboardButton("🔑 设置监听关键词", callback_data=f"action:set_listen_keywords:{phone}")],
+            [InlineKeyboardButton("🔙 返回账户详情", callback_data=f"select_account:{phone}")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    async def _set_listen_group_callback(self, query, user, group_id):
+        phone = self.account_manager.get_user_state(user).get('current_account')
+        if not phone:
+            await query.edit_message_text("❌ 请先选择账户")
+            return
+        client = self.account_manager.clients.get(phone)
+        group_name = str(group_id)
+        if client:
+            try:
+                entity = await client.get_entity(group_id)
+                group_name = getattr(entity, 'title', str(group_id))
+            except:
+                pass
+        await self.bet_listener.set_listen_group(phone, group_id, group_name, user)
+        await self._show_account_detail(query, user, phone, None)
+
+    async def _set_game_group_callback(self, query, user, group_id):
         phone = self.account_manager.get_user_state(user).get('current_account')
         if not phone:
             await query.edit_message_text("❌ 请先选择账户")
@@ -3722,7 +3711,8 @@ class PC28Bot:
 *监听状态:*
 • 自动投注: {'✅ 开启' if acc.auto_betting else '❌ 关闭'}
 • 预测播报: {'✅ 开启' if acc.prediction_broadcast else '❌ 关闭'}
-• 跟随投注: {'✅ 开启' if acc.follow_betting_enabled else '❌ 关闭'}
+• 监听模式: {'✅ 开启' if acc.listening_enabled else '❌ 关闭'}
+• 监听群组: {acc.listen_group_name or '未设置'}
 • 播报内容: {'双组' if acc.prediction_content=='double' else '杀组'}
 
 *投注设置:*
@@ -3843,6 +3833,7 @@ class PC28Bot:
         logged = sum(1 for a in self.account_manager.accounts.values() if a.is_logged_in)
         auto = sched_stats['auto_betting_accounts']
         broadcast = sched_stats['broadcast_accounts']
+        listen = sched_stats['listening_accounts']
         total_profit = sum(a.total_profit for a in self.account_manager.accounts.values())
         total_loss = sum(a.total_loss for a in self.account_manager.accounts.values())
         net = total_profit - total_loss
@@ -3858,6 +3849,7 @@ class PC28Bot:
 • 已登录: {logged}
 • 自动投注: {auto}
 • 预测播报: {broadcast}
+• 监听模式: {listen}
 
 *盈利统计*
 • 总盈利: {total_profit:.2f}KK
@@ -3881,14 +3873,20 @@ class PC28Bot:
 
 • 添加账户：在“账户管理”中点击“➕ 添加账户”，输入手机号即可。
 • 登录：在账户列表中选择账户，点击“🔐 登录”。
-• 设置群组：进入账户详情，点击“💬 游戏群”或“📢 播报群”，从列表中选择。
+• 设置群组：进入账户详情，点击“💬 游戏群”、“📢 播报群”或“🔍 监听群组”，从列表中选择。
 • 投注设置：在“投注设置”区域选择方案、策略、金额、追号。
 • 播报设置：在“播报设置”区域选择播报群和播报内容（双组/杀组）。
+• 监听设置（新功能）：在“监听设置”区域设置监听群组和触发条件。
 • 自选杀组：在“投注设置”区域点击“🎯 自选杀组”，选择您想永远排除的组合。
-• 自动投注/播报：点击相应按钮即可开启/关闭（播报停止会等待最后一期开奖）。
-• 跟随投注：点击“🔍 开启跟随投注”后，系统会监听群消息中的“✅ 投注成功”，检测到后立即跟投。
+• 自动投注/播报/监听：点击相应按钮即可开启/关闭。
 • 查询余额/账户状态：点击相应按钮。
 • 手动投注：在游戏群发送“类型 金额”即可，如“大 10000”。
+
+*监听模式说明（新功能）* 🔍
+监听模式会自动监测您指定的群组中的投注成功消息，当检测到其他用户投注成功时，系统会根据您的预测算法自动执行投注。
+- 设置监听群组后，请确保自动投注已开启
+- 监听到消息后会延迟1秒后执行投注（可在设置中调整）
+- 支持自定义监听关键词
 
 *预测算法说明*
 本系统使用双杀组+双Y融合算法进行预测：
@@ -3904,15 +3902,6 @@ class PC28Bot:
   - 连胜：第3把开始翻倍，倍数依次为1.2→1.4→1.6→1.8→2.0（封顶2倍）
   - 连输：输一把直接翻3倍，输两把翻6倍，输三把翻12倍...无上限
   - 输赢分别独立计数，输赢切换后重置对应的计数器
-
-*自选杀组功能*
-如果您想固定排除某个组合（例如您认为某个组合近期不会出），可以使用此功能。
-设置后，无论AI预测结果如何，系统都会始终排除您选择的组合。
-
-*跟随投注功能*
-开启后，系统会自动监听游戏群中的消息。
-当检测到“✅ 投注成功”时，立即使用当前AI预测结果进行投注。
-注意：开启跟随投注后，自动投注会自动禁用，两者互斥。
 
 如有问题，请联系管理员。
         """
@@ -3956,8 +3945,8 @@ class PC28Bot:
 
     async def _cmd_logout_inline(self, query, user, phone, context):
         await self.game_scheduler.stop_auto_betting(phone, user)
-        await self.game_scheduler.stop_follow_betting(phone, user)
         await self.prediction_broadcaster.stop_broadcast(phone, user)
+        await self.bet_listener.stop_listening(phone, user)
         client = self.account_manager.clients.get(phone)
         if client:
             try:
@@ -3976,7 +3965,7 @@ class PC28Bot:
             is_logged_in=False,
             auto_betting=False,
             prediction_broadcast=False,
-            follow_betting_enabled=False,
+            listening_enabled=False,
             display_name='',
             chase_enabled=False,
             chase_numbers=[],
@@ -4131,7 +4120,7 @@ def main():
     print("""
 ========================================
 PC28自动投注系统
-基于双杀组+双Y融合算法 | AI辅助验证
+基于双杀组+双Y融合算法 | AI辅助验证 | 监听模式
 ========================================
 启动中...
     """)
