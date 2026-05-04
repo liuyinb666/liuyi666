@@ -2008,77 +2008,82 @@ class GameScheduler:
         return True, "自动投注已关闭"
 
     async def start_follow_betting(self, phone: str, user_id: int) -> Tuple[bool, str]:
-        """开启跟随投注模式 - 检测到别人投注成功后才投注"""
-        acc = self.account_manager.get_account(phone)
-        if not acc:
-            return False, "账户不存在"
-        if not acc.is_logged_in:
-            return False, "请先登录账户"
-        if not acc.game_group_id:
-            return False, "请先设置游戏群"
-        
-        # 如果已经在运行，先停止
-        if phone in self.follow_listener_tasks and not self.follow_listener_tasks[phone].done():
-            self.follow_listener_tasks[phone].cancel()
-        
-        await self.account_manager.update_account(phone, follow_betting_enabled=True)
-        
-        # 启动监听任务
-        self.follow_listener_tasks[phone] = asyncio.create_task(
-            self._follow_listen_loop(phone, acc.game_group_id)
-        )
-        
-        logger.log_betting(user_id, "跟随投注开启", f"账户:{phone} 将检测到'✅ 投注成功'后自动投注")
-        return True, "跟随投注已开启，将检测到别人投注成功（✅ 投注成功）后自动跟投"
+    """开启跟随投注模式 - 检测到@kk28投注成功后才投注"""
+    acc = self.account_manager.get_account(phone)
+    if not acc:
+        return False, "账户不存在"
+    if not acc.is_logged_in:
+        return False, "请先登录账户"
+    if not acc.game_group_id:
+        return False, "请先设置游戏群"
     
-    async def stop_follow_betting(self, phone: str, user_id: int) -> Tuple[bool, str]:
-        """关闭跟随投注模式"""
-        await self.account_manager.update_account(phone, follow_betting_enabled=False)
-        
-        if phone in self.follow_listener_tasks and not self.follow_listener_tasks[phone].done():
-            self.follow_listener_tasks[phone].cancel()
-        
-        logger.log_betting(user_id, "跟随投注关闭", f"账户:{phone}")
-        return True, "跟随投注已关闭"
+    # 如果已经在运行，先停止
+    if phone in self.follow_listener_tasks and not self.follow_listener_tasks[phone].done():
+        self.follow_listener_tasks[phone].cancel()
     
-    async def _follow_listen_loop(self, phone: str, group_id: int):
-        """监听群消息的循环 - 检测'✅ 投注成功'关键词"""
-        client = self.account_manager.clients.get(phone)
-        if not client:
-            logger.log_error(0, f"跟随监听启动失败 {phone}", "客户端不存在")
-            return
-        
-        error_count = 0
-        last_message_id = 0
-        
-        logger.log_system(f"跟随监听器已启动: {phone} 监听群组 {group_id}")
-        
-        while True:
+    await self.account_manager.update_account(phone, follow_betting_enabled=True)
+    
+    # 启动监听任务
+    self.follow_listener_tasks[phone] = asyncio.create_task(
+        self._follow_listen_loop(phone, acc.game_group_id)
+    )
+    
+    logger.log_betting(user_id, "跟随投注开启", f"账户:{phone} 将检测到@kk28的✅ 投注成功")
+    return True, "跟随投注已开启，将检测到@kk28发送的✅ 投注成功后自动跟投"
+
+async def stop_follow_betting(self, phone: str, user_id: int) -> Tuple[bool, str]:
+    """关闭跟随投注模式"""
+    await self.account_manager.update_account(phone, follow_betting_enabled=False)
+    
+    if phone in self.follow_listener_tasks and not self.follow_listener_tasks[phone].done():
+        self.follow_listener_tasks[phone].cancel()
+    
+    logger.log_betting(user_id, "跟随投注关闭", f"账户:{phone}")
+    return True, "跟随投注已关闭"
+
+async def _follow_listen_loop(self, phone: str, group_id: int):
+    """监听群消息的循环 - 检测@kk28发送的'✅ 投注成功'"""
+    client = self.account_manager.clients.get(phone)
+    if not client:
+        logger.log_error(0, f"跟随监听启动失败 {phone}", "客户端不存在")
+        return
+    
+    error_count = 0
+    last_message_id = 0
+    
+    logger.log_system(f"跟随监听器已启动: {phone} 监听群组 {group_id}，目标: @kk28 发送的 ✅ 投注成功")
+    
+    while True:
+        try:
+            acc = self.account_manager.get_account(phone)
+            if not acc or not acc.follow_betting_enabled:
+                logger.log_system(f"跟随监听器已停止: {phone}")
+                break
+            
+            if not await self.account_manager.ensure_client_connected(phone):
+                await asyncio.sleep(5)
+                continue
+            
+            # 获取最新消息
             try:
-                acc = self.account_manager.get_account(phone)
-                if not acc or not acc.follow_betting_enabled:
-                    logger.log_system(f"跟随监听器已停止: {phone}")
-                    break
-                
-                if not await self.account_manager.ensure_client_connected(phone):
-                    await asyncio.sleep(5)
-                    continue
-                
-                # 获取最新消息
-                try:
-                    messages = await client.get_messages(group_id, limit=10, min_id=last_message_id)
-                except Exception as e:
-                    logger.log_error(phone, "获取群消息失败", e)
-                    await asyncio.sleep(5)
-                    continue
-                
-                for msg in messages:
-                    if msg.text and msg.id > last_message_id:
-                        last_message_id = msg.id
+                messages = await client.get_messages(group_id, limit=10, min_id=last_message_id)
+            except Exception as e:
+                logger.log_error(phone, "获取群消息失败", e)
+                await asyncio.sleep(5)
+                continue
+            
+            for msg in messages:
+                if msg.text and msg.id > last_message_id:
+                    last_message_id = msg.id
+                    
+                    # 检测是否是 @kk28 发送的投注成功消息
+                    try:
+                        sender = await client.get_entity(msg.sender_id)
+                        sender_username = getattr(sender, 'username', '')
                         
-                        # 检测是否有人投注成功 - 只检测 "✅ 投注成功"
-                        if "✅ 投注成功" in msg.text:
-                            logger.log_betting(0, "检测到别人投注成功", 
+                        # 检查发送者用户名是否是 kk28，且消息包含"✅ 投注成功"
+                        if sender_username == 'kk28' and "✅ 投注成功" in msg.text:
+                            logger.log_betting(0, "检测到@kk28投注成功", 
                                 f"账户:{phone} 消息:{msg.text[:100]}")
                             
                             # 获取当前期号
@@ -2093,124 +2098,127 @@ class GameScheduler:
                             
                             # 触发投注
                             await self._execute_follow_bet(phone, current_qihao)
-                
-                await asyncio.sleep(2)  # 每2秒检查一次
-                error_count = 0
-                
-            except asyncio.CancelledError:
-                logger.log_system(f"跟随监听器任务被取消: {phone}")
+                    except Exception as e:
+                        logger.log_error(phone, f"获取发送者信息失败", e)
+                        continue
+            
+            await asyncio.sleep(2)  # 每2秒检查一次
+            error_count = 0
+            
+        except asyncio.CancelledError:
+            logger.log_system(f"跟随监听器任务被取消: {phone}")
+            break
+        except Exception as e:
+            error_count += 1
+            logger.log_error(phone, f"跟随监听循环异常", e)
+            if error_count >= 10:
+                logger.log_error(phone, "跟随监听器错误过多，停止", e)
+                await self.account_manager.update_account(phone, follow_betting_enabled=False)
                 break
-            except Exception as e:
-                error_count += 1
-                logger.log_error(phone, f"跟随监听循环异常", e)
-                if error_count >= 10:
-                    logger.log_error(phone, "跟随监听器错误过多，停止", e)
-                    await self.account_manager.update_account(phone, follow_betting_enabled=False)
-                    break
-                await asyncio.sleep(10)
-        
-        # 清理任务引用
-        if phone in self.follow_listener_tasks:
-            del self.follow_listener_tasks[phone]
+            await asyncio.sleep(10)
     
-    async def _execute_follow_bet(self, phone: str, current_qihao: Optional[str]):
-        """执行跟随投注"""
-        acc = self.account_manager.get_account(phone)
-        if not acc or not acc.follow_betting_enabled:
+    # 清理任务引用
+    if phone in self.follow_listener_tasks:
+        del self.follow_listener_tasks[phone]
+
+async def _execute_follow_bet(self, phone: str, current_qihao: Optional[str]):
+    """执行跟随投注"""
+    acc = self.account_manager.get_account(phone)
+    if not acc or not acc.follow_betting_enabled:
+        return
+    
+    # 获取锁，防止重复投注
+    lock = self.account_manager.account_locks.setdefault(phone, asyncio.Lock())
+    async with lock:
+        if acc.betting_in_progress:
+            logger.log_betting(0, "账户投注正在进行中，跳过本次跟随投注", f"账户:{phone}")
+            return
+        await self.account_manager.update_account(phone, betting_in_progress=True)
+    
+    try:
+        # 获取最新历史数据用于预测
+        history = await self.api.get_history(50)
+        latest = await self.api.get_latest_result()
+        
+        if len(history) < 3:
+            logger.log_betting(0, "历史数据不足，跳过跟随投注", f"账户:{phone}")
             return
         
-        # 获取锁，防止重复投注
-        lock = self.account_manager.account_locks.setdefault(phone, asyncio.Lock())
-        async with lock:
-            if acc.betting_in_progress:
-                logger.log_betting(0, "账户投注正在进行中，跳过本次跟随投注", f"账户:{phone}")
-                return
-            await self.account_manager.update_account(phone, betting_in_progress=True)
+        # 获取预测结果
+        prediction = await self.model.predict(history, latest)
         
-        try:
-            # 获取最新历史数据用于预测
-            history = await self.api.get_history(50)
-            latest = await self.api.get_latest_result()
-            
-            if len(history) < 3:
-                logger.log_betting(0, "历史数据不足，跳过跟随投注", f"账户:{phone}")
+        # 获取最终的杀组：优先使用用户自选杀组，否则使用AI预测的杀组
+        final_kill = acc.user_manual_kill if acc.user_manual_kill else prediction.get('kill')
+        
+        # 获取当前余额
+        cur_bal = await self._query_balance(phone)
+        if cur_bal is None or cur_bal <= 0:
+            logger.log_betting(0, "获取余额失败或余额不足", f"账户:{phone}")
+            return
+        
+        # 计算投注金额
+        bet_amount, updates = self._calculate_bet_amount(acc, cur_bal)
+        if updates:
+            await self.account_manager.update_account(phone, **updates)
+        
+        bet_amount = min(bet_amount, acc.bet_params.max_amount)
+        bet_amount = max(bet_amount, Config.MIN_BET_AMOUNT)
+        
+        # 根据方案获取投注类型
+        if acc.betting_scheme == '杀主':
+            if not final_kill:
+                logger.log_betting(0, "无可用杀组，跳过跟随投注", f"账户:{phone}")
                 return
+            bet_types = [c for c in COMBOS if c != final_kill]
+            logger.log_betting(0, f"跟随投注 - 最终杀组: {final_kill}, 投注组合: {bet_types}", f"账户:{phone}")
+        else:
+            bet_types = self._get_bet_types(prediction, acc.betting_scheme)
+        
+        total = bet_amount * len(bet_types)
+        if cur_bal < total:
+            logger.log_betting(0, "跟随投注余额不足", f"账户:{phone} 余额:{cur_bal} 需要:{total}")
+            return
+        
+        # 发送投注
+        bet_items = [f"{t} {bet_amount}" for t in bet_types]
+        logger.log_betting(0, f"跟随投注发送: {bet_items}", f"账户:{phone}")
+        
+        success = await self._send_bets(phone, bet_items, is_chase=False)
+        
+        if success:
+            self.game_stats['successful_bets'] += 1
+            self.game_stats['betting_cycles'] += 1
+            await self.account_manager.update_account(phone,
+                last_bet_time=datetime.now().isoformat(),
+                last_bet_amount=bet_amount,
+                last_bet_types=bet_types,
+                total_bets=acc.total_bets + 1,
+                last_bet_total=total,
+                last_prediction={
+                    'main': prediction['main'],
+                    'candidate': prediction['candidate'],
+                    'confidence': prediction['confidence'],
+                    'kill': final_kill
+                },
+                last_bet_period=current_qihao
+            )
+            logger.log_betting(0, "跟随投注成功", 
+                f"账户:{phone} 每注金额:{bet_amount} 总金额:{total} 类型:{bet_types} 期号:{current_qihao}")
             
-            # 获取预测结果
-            prediction = await self.model.predict(history, latest)
+            # 投注后查询余额
+            asyncio.create_task(self._query_balance(phone))
+        else:
+            self.game_stats['failed_bets'] += 1
+            logger.log_betting(0, "跟随投注发送失败", f"账户:{phone}")
             
-            # 获取最终的杀组：优先使用用户自选杀组，否则使用AI预测的杀组
-            final_kill = acc.user_manual_kill if acc.user_manual_kill else prediction.get('kill')
-            
-            # 获取当前余额
-            cur_bal = await self._query_balance(phone)
-            if cur_bal is None or cur_bal <= 0:
-                logger.log_betting(0, "获取余额失败或余额不足", f"账户:{phone}")
-                return
-            
-            # 计算投注金额
-            bet_amount, updates = self._calculate_bet_amount(acc, cur_bal)
-            if updates:
-                await self.account_manager.update_account(phone, **updates)
-            
-            bet_amount = min(bet_amount, acc.bet_params.max_amount)
-            bet_amount = max(bet_amount, Config.MIN_BET_AMOUNT)
-            
-            # 根据方案获取投注类型
-            if acc.betting_scheme == '杀主':
-                if not final_kill:
-                    logger.log_betting(0, "无可用杀组，跳过跟随投注", f"账户:{phone}")
-                    return
-                bet_types = [c for c in COMBOS if c != final_kill]
-                logger.log_betting(0, f"跟随投注 - 最终杀组: {final_kill}, 投注组合: {bet_types}", f"账户:{phone}")
-            else:
-                bet_types = self._get_bet_types(prediction, acc.betting_scheme)
-            
-            total = bet_amount * len(bet_types)
-            if cur_bal < total:
-                logger.log_betting(0, "跟随投注余额不足", f"账户:{phone} 余额:{cur_bal} 需要:{total}")
-                return
-            
-            # 发送投注
-            bet_items = [f"{t} {bet_amount}" for t in bet_types]
-            logger.log_betting(0, f"跟随投注发送: {bet_items}", f"账户:{phone}")
-            
-            success = await self._send_bets(phone, bet_items, is_chase=False)
-            
-            if success:
-                self.game_stats['successful_bets'] += 1
-                self.game_stats['betting_cycles'] += 1
-                await self.account_manager.update_account(phone,
-                    last_bet_time=datetime.now().isoformat(),
-                    last_bet_amount=bet_amount,
-                    last_bet_types=bet_types,
-                    total_bets=acc.total_bets + 1,
-                    last_bet_total=total,
-                    last_prediction={
-                        'main': prediction['main'],
-                        'candidate': prediction['candidate'],
-                        'confidence': prediction['confidence'],
-                        'kill': final_kill
-                    },
-                    last_bet_period=current_qihao
-                )
-                logger.log_betting(0, "跟随投注成功", 
-                    f"账户:{phone} 每注金额:{bet_amount} 总金额:{total} 类型:{bet_types} 期号:{current_qihao}")
-                
-                # 投注后查询余额
-                asyncio.create_task(self._query_balance(phone))
-            else:
-                self.game_stats['failed_bets'] += 1
-                logger.log_betting(0, "跟随投注发送失败", f"账户:{phone}")
-                
-        except Exception as e:
-            logger.log_error(phone, "跟随投注执行异常", e)
-        finally:
-            # 释放投注锁
-            async with lock:
-                acc = self.account_manager.get_account(phone)
-                if acc:
-                    acc.betting_in_progress = False
+    except Exception as e:
+        logger.log_error(phone, "跟随投注执行异常", e)
+    finally:
+        # 释放投注锁
+        async with lock:
+            acc = self.account_manager.get_account(phone)
+            if acc:
+                acc.betting_in_progress = False
 
     async def check_bet_result(self, phone, expected_qihao, latest_result):
         acc = self.account_manager.get_account(phone)
