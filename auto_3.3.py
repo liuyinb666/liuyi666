@@ -1103,7 +1103,6 @@ class Account:
     streak_win_count: int = 0
     streak_loss_count: int = 0
     currency: str = Config.DEFAULT_CURRENCY
-    bet_delay_seconds: int = Config.DEFAULT_BET_DELAY_SECONDS
 
     def get_display_name(self) -> str:
         return self.display_name if self.display_name else self.phone
@@ -1146,20 +1145,19 @@ class AccountManager:
                     acc_dict.pop('listen_keywords', None)
                     acc_dict.pop('listen_last_trigger', None)
                     acc_dict.pop('listen_delay_seconds', None)
+                    acc_dict.pop('bet_delay_seconds', None)
                     
                     bet_params_dict = acc_dict.get('bet_params', {})
                     bet_params = BetParams(**bet_params_dict)
                     acc_dict['bet_params'] = bet_params
                     if 'currency' not in acc_dict:
                         acc_dict['currency'] = Config.DEFAULT_CURRENCY
-                    if 'bet_delay_seconds' not in acc_dict:
-                        acc_dict['bet_delay_seconds'] = Config.DEFAULT_BET_DELAY_SECONDS
                     for key in ['needs_2fa', 'login_temp_data', 'chase_enabled', 'chase_numbers', 'chase_periods',
                                 'chase_current', 'chase_amount', 'chase_stop_reason', 'streak_records',
                                 'current_streak_type', 'current_streak_start', 'current_streak_messages',
                                 'current_streak_count', 'last_message_id', 'prediction_content',
                                 'broadcast_stop_requested', 'betting_in_progress', 'user_manual_kill',
-                                'streak_win_count', 'streak_loss_count', 'currency', 'bet_delay_seconds']:
+                                'streak_win_count', 'streak_loss_count', 'currency']:
                         if key not in acc_dict:
                             if key == 'chase_numbers': acc_dict[key] = []
                             elif key == 'streak_records': acc_dict[key] = []
@@ -1182,7 +1180,6 @@ class AccountManager:
                             elif key == 'streak_win_count': acc_dict[key] = 0
                             elif key == 'streak_loss_count': acc_dict[key] = 0
                             elif key == 'currency': acc_dict[key] = Config.DEFAULT_CURRENCY
-                            elif key == 'bet_delay_seconds': acc_dict[key] = Config.DEFAULT_BET_DELAY_SECONDS
                     self.accounts[phone] = Account(**acc_dict)
             except Exception as e:
                 logger.log_error(0, "加载账户数据失败", e)
@@ -1736,26 +1733,6 @@ class PredictionBroadcaster:
                     return None
             return None
 
-# ==================== 投注延迟管理器（替代监听器） ====================
-class BetDelayManager:
-    def __init__(self, account_manager):
-        self.account_manager = account_manager
-        
-    async def set_bet_delay(self, phone: str, delay: int, user_id: int) -> Tuple[bool, str]:
-        if delay < 0:
-            delay = 0
-        if delay > 30:
-            delay = 30
-        await self.account_manager.update_account(phone, bet_delay_seconds=delay)
-        logger.log_delay(user_id, "设置投注延迟", f"账户:{phone} 延迟:{delay}秒")
-        return True, f"投注延迟已设置为 {delay} 秒"
-    
-    async def get_bet_delay(self, phone: str) -> int:
-        acc = self.account_manager.get_account(phone)
-        if acc:
-            return acc.bet_delay_seconds
-        return Config.DEFAULT_BET_DELAY_SECONDS
-
 # ==================== 游戏调度器 ====================
 class GameScheduler:
     def __init__(self, account_manager, model_manager, api_client):
@@ -1785,6 +1762,15 @@ class GameScheduler:
         acc = self.account_manager.get_account(phone)
         if not acc: 
             return
+        
+        # 检查追号结果
+        if acc.chase_enabled and acc.last_bet_period == expected_qihao:
+            actual_num = latest_result.get('total')
+            if actual_num is not None and actual_num in acc.chase_numbers:
+                logger.log_betting(0, "追号中奖", f"账户:{phone} 期号:{expected_qihao} 数字:{actual_num} 中奖!")
+            else:
+                logger.log_betting(0, "追号未中", f"账户:{phone} 期号:{expected_qihao} 数字:{actual_num if actual_num is not None else 'unknown'}")
+        
         scheme = acc.betting_scheme
         last_pred = acc.last_prediction
         last_bet_types = acc.last_bet_types
@@ -1861,7 +1847,8 @@ class GameScheduler:
         bet_amount = min(bet_amount, max_limit)
         bet_amount = max(bet_amount, min_limit)
         
-        bet_items = [f"{num}/{bet_amount}" for num in acc.chase_numbers]
+        # 修复：消息格式改为 "数字 金额" 而不是 "数字/金额"
+        bet_items = [f"{num} {bet_amount}" for num in acc.chase_numbers]
         if not bet_items: 
             return
         
@@ -1874,8 +1861,12 @@ class GameScheduler:
         success = await self._send_bets(phone, bet_items, is_chase=True)
         if success:
             new_current = acc.chase_current + 1
-            await self.account_manager.update_account(phone, chase_current=new_current, last_bet_period=current_qihao,
-                last_bet_types=[str(num) for num in acc.chase_numbers], last_bet_amount=bet_amount, last_bet_total=total_needed)
+            await self.account_manager.update_account(phone, 
+                chase_current=new_current, 
+                last_bet_period=current_qihao,
+                last_bet_types=[str(num) for num in acc.chase_numbers], 
+                last_bet_amount=bet_amount, 
+                last_bet_total=total_needed)
             logger.log_betting(0, "追号成功", f"账户:{phone} 数字:{acc.chase_numbers} 金额:{format_amount(bet_amount, acc.currency)} 进度:{new_current}/{acc.chase_periods}")
             asyncio.create_task(self._query_balance(phone))
 
@@ -1987,9 +1978,9 @@ class GameScheduler:
                 return
             acc.betting_in_progress = True
         try:
-            if acc.bet_delay_seconds > 0:
-                logger.log_delay(0, f"投注延迟 {acc.bet_delay_seconds} 秒", f"账户:{phone}")
-                await asyncio.sleep(acc.bet_delay_seconds)
+            # 使用固定的15秒延迟
+            logger.log_delay(0, f"投注延迟 {Config.DEFAULT_BET_DELAY_SECONDS} 秒", f"账户:{phone}")
+            await asyncio.sleep(Config.DEFAULT_BET_DELAY_SECONDS)
             
             await self.execute_chase(phone, latest)
             if not acc.auto_betting: 
@@ -2407,12 +2398,11 @@ class PC28Bot:
             None, self.game_scheduler
         )
         self.prediction_broadcaster = PredictionBroadcaster(self.account_manager, self.model, self.api, self.global_scheduler)
-        self.bet_delay_manager = BetDelayManager(self.account_manager)
         self.global_scheduler.prediction_broadcaster = self.prediction_broadcaster
 
         self.application = Application.builder().token(Config.BOT_TOKEN).build()
         self._register_handlers()
-        logger.log_system("PC28 Bot（杀组算法版 - 投注延迟模式 + 多币种支持KKCOIN/USDT/CNY）初始化完成")
+        logger.log_system("PC28 Bot（杀组算法版 - 固定15秒投注延迟 + 多币种支持KKCOIN/USDT/CNY）初始化完成")
 
     def _register_handlers(self):
         self.application.add_handler(CommandHandler("start", self.cmd_start))
@@ -2452,18 +2442,6 @@ class PC28Bot:
         )
         self.application.add_handler(chase_conv)
 
-        bet_delay_conv = ConversationHandler(
-            entry_points=[CallbackQueryHandler(self.bet_delay_start, pattern=r'^action:set_bet_delay:')],
-            states={
-                1: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.bet_delay_input)],
-            },
-            fallbacks=[
-                CommandHandler('cancel', self.cmd_cancel),
-                CallbackQueryHandler(self.bet_delay_cancel, pattern=r'^bet_delay_cancel:')
-            ],
-        )
-        self.application.add_handler(bet_delay_conv)
-
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message))
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
         self.application.add_error_handler(self.error_handler)
@@ -2481,13 +2459,14 @@ class PC28Bot:
             [InlineKeyboardButton("🎯 智能预测", callback_data="menu:prediction")],
             [InlineKeyboardButton("📊 系统状态", callback_data="menu:status")],
             [InlineKeyboardButton("❓ 帮助", callback_data="menu:help")],
-            [InlineKeyboardButton("📖 使用手册", url=Config.MANUAL_LINK)]
+            [InlineKeyboardButton("📖 使用手册", url=Config.MANUAL_LINK)],
+            [InlineKeyboardButton("🔄 刷新菜单", callback_data="menu:main")]
         ]
         await update.message.reply_text(
             "🎰 *PC28 智能预测投注系统*\n\n"
             "✨ 欢迎使用！基于杀组算法\n"
             "🤖 硅基流动AI辅助验证\n"
-            "⏱️ 投注延迟模式：自定义延迟时间后自动投注\n"
+            "⏱️ 固定投注延迟：15秒\n"
             "💱 多币种支持：KKCOIN / USDT / CNY\n\n"
             "请选择操作：",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2498,7 +2477,8 @@ class PC28Bot:
         query = update.callback_query
         await query.answer()
         context.user_data['adding_account'] = True
-        await query.edit_message_text("📱 请输入手机号（包含国际区号，如 +861234567890）：\n\n点击 /cancel 取消")
+        kb = [[InlineKeyboardButton("🔙 返回", callback_data="menu:accounts")]]
+        await query.edit_message_text("📱 请输入手机号（包含国际区号，如 +861234567890）：\n\n点击 /cancel 取消", reply_markup=InlineKeyboardMarkup(kb))
         return Config.ADD_ACCOUNT
 
     async def add_account_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2509,8 +2489,27 @@ class PC28Bot:
             await update.message.reply_text(f"✅ {msg}")
         else:
             await update.message.reply_text(f"❌ {msg}")
-        await self._show_main_menu(update.message)
+        await self._show_main_menu_from_message(update.message)
         return ConversationHandler.END
+
+    async def _show_main_menu_from_message(self, message):
+        keyboard = [
+            [InlineKeyboardButton("📱 账户管理", callback_data="menu:accounts")],
+            [InlineKeyboardButton("🎯 智能预测", callback_data="menu:prediction")],
+            [InlineKeyboardButton("📊 系统状态", callback_data="menu:status")],
+            [InlineKeyboardButton("❓ 帮助", callback_data="menu:help")],
+            [InlineKeyboardButton("📖 使用手册", url=Config.MANUAL_LINK)]
+        ]
+        await message.reply_text(
+            "🎰 *PC28 智能预测投注系统*\n\n"
+            "✨ 欢迎使用！基于杀组算法\n"
+            "🤖 硅基流动AI辅助验证\n"
+            "⏱️ 固定投注延迟：15秒\n"
+            "💱 多币种支持：KKCOIN / USDT / CNY\n\n"
+            "请选择操作：",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
 
     async def login_select(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -2546,7 +2545,8 @@ class PC28Bot:
             else:
                 res = await client.send_code_request(phone)
                 self.account_manager.set_login_session(phone, {'phone_code_hash': res.phone_code_hash})
-                await query.edit_message_text(f"📨 验证码已发送到 `{phone}`\n\n请输入验证码：", parse_mode='Markdown')
+                kb = [[InlineKeyboardButton("🔙 取消", callback_data=f"select_account:{phone}")]]
+                await query.edit_message_text(f"📨 验证码已发送到 `{phone}`\n\n请输入验证码：", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
                 return Config.LOGIN_CODE
         except Exception as e:
             logger.log_error(query.from_user.id, f"登录失败 {phone}", e)
@@ -2649,7 +2649,8 @@ class PC28Bot:
             "📌 说明：追号将每期自动投注您指定的所有数字，直到期数用完或手动停止。"
         )
         reply_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ 取消", callback_data=f"chase_cancel:{phone}")]
+            [InlineKeyboardButton("❌ 取消", callback_data=f"chase_cancel:{phone}")],
+            [InlineKeyboardButton("🔙 返回账户详情", callback_data=f"select_account:{phone}")]
         ])
         await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
         return Config.CHASE_NUMBERS
@@ -2694,7 +2695,8 @@ class PC28Bot:
             "例如：`10` 表示连续追10期。"
         )
         reply_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ 取消", callback_data=f"chase_cancel:{phone}")]
+            [InlineKeyboardButton("❌ 取消", callback_data=f"chase_cancel:{phone}")],
+            [InlineKeyboardButton("🔙 返回上一步", callback_data=f"chase_cancel:{phone}")]
         ])
         await update.message.reply_text(text, reply_markup=reply_markup)
         return Config.CHASE_PERIODS
@@ -2785,58 +2787,8 @@ class PC28Bot:
         if acc:
             await self._show_account_detail(update.message, user_id, phone, context)
         else:
-            await self._show_accounts_menu(update.message, user_id)
+            await self._show_accounts_menu_from_message(update.message, user_id)
 
-        return ConversationHandler.END
-
-    async def bet_delay_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        phone = query.data.split(':')[1]
-        context.user_data['bet_delay_phone'] = phone
-        
-        text = (
-            "⏱️ *设置投注延迟*\n\n"
-            "请输入延迟秒数（0-30秒）。\n\n"
-            "投注延迟是指：检测到新期号后，等待指定秒数后再执行投注。\n\n"
-            "• 0秒：立即投注\n"
-            "• 1-5秒：推荐设置，避开高峰期\n"
-            "• 5-10秒：较保守设置\n\n"
-            "当前默认：1秒\n\n"
-            "例如：`2` 表示延迟2秒后投注"
-        )
-        reply_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ 取消", callback_data=f"bet_delay_cancel:{phone}")]
-        ])
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
-        return 1
-
-    async def bet_delay_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        phone = context.user_data.get('bet_delay_phone')
-        if not phone:
-            await update.message.reply_text("会话已过期，请重新操作")
-            return ConversationHandler.END
-        
-        try:
-            delay = int(update.message.text.strip())
-            if delay < 0:
-                delay = 0
-            if delay > 30:
-                delay = 30
-        except ValueError:
-            await update.message.reply_text("❌ 请输入有效的数字（0-30）")
-            return 1
-        
-        await self.bet_delay_manager.set_bet_delay(phone, delay, update.effective_user.id)
-        await update.message.reply_text(f"✅ 投注延迟已设置为 {delay} 秒")
-        await self._show_account_detail(update.message, update.effective_user.id, phone, context)
-        return ConversationHandler.END
-
-    async def bet_delay_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        phone = query.data.split(':')[1]
-        await self._show_account_detail(query, query.from_user.id, phone, context)
         return ConversationHandler.END
 
     def _get_account_detail_text_and_kb(self, phone):
@@ -2877,10 +2829,6 @@ class PC28Bot:
              InlineKeyboardButton(f"🎛️ 播报内容({content_type})", callback_data=f"toggle_content:{phone}")],
         ]
         
-        delay_menu = [
-            [InlineKeyboardButton(f"⏱️ 投注延迟({acc.bet_delay_seconds}秒)", callback_data=f"action:set_bet_delay:{phone}")],
-        ]
-        
         currency_menu = [
             [InlineKeyboardButton("💱 投注币种", callback_data=f"action:setcurrency:{phone}")],
         ]
@@ -2889,21 +2837,22 @@ class PC28Bot:
             [InlineKeyboardButton("🔐 登录", callback_data=f"login_select:{phone}"),
              InlineKeyboardButton("🚪 登出", callback_data=f"action:logout:{phone}")],
             [InlineKeyboardButton("💬 游戏群", callback_data=f"action:listgroups:{phone}")],
-        ] + betting_menu + broadcast_menu + delay_menu + currency_menu + [
+        ] + betting_menu + broadcast_menu + currency_menu + [
             [InlineKeyboardButton(bet_button, callback_data=f"action:toggle_bet:{phone}"),
              InlineKeyboardButton(pred_button, callback_data=f"action:toggle_pred:{phone}")],
             [InlineKeyboardButton("💰 查询余额", callback_data=f"action:balance:{phone}"),
              InlineKeyboardButton("📊 账户状态", callback_data=f"action:status:{phone}")],
             [InlineKeyboardButton("📊 连输连赢记录", callback_data=f"action:streak:{phone}"),
              InlineKeyboardButton("📚 手动投注说明", callback_data=f"action:manual_bet_help:{phone}")],
-            [InlineKeyboardButton("🔙 返回", callback_data="menu:accounts")]
+            [InlineKeyboardButton("🔙 返回账户列表", callback_data="menu:accounts"),
+             InlineKeyboardButton("🏠 返回主菜单", callback_data="menu:main")]
         ]
 
         if acc.chase_enabled:
             status += f" | 🔢 追{acc.chase_current}/{acc.chase_periods}"
             kb.insert(4, [InlineKeyboardButton("🛑 停止追号", callback_data=f"action:stopchase:{phone}")])
 
-        text = f"📱 *账户: {display}*\n\n状态: {status}\n币种: {acc.currency}\n余额: {format_amount(acc.balance, acc.currency)}\n净盈利: {format_amount(net_profit, acc.currency)}\n投注延迟: {acc.bet_delay_seconds}秒\n{kill_status}\n\n选择操作:"
+        text = f"📱 *账户: {display}*\n\n状态: {status}\n币种: {acc.currency}\n余额: {format_amount(acc.balance, acc.currency)}\n净盈利: {format_amount(net_profit, acc.currency)}\n固定投注延迟: 15秒\n{kill_status}\n\n选择操作:"
         return text, InlineKeyboardMarkup(kb)
 
     async def _show_account_detail(self, target, user, phone, context):
@@ -3005,16 +2954,13 @@ class PC28Bot:
             "menu:prediction": self._show_prediction_menu,
             "menu:status": self._show_status_menu,
             "menu:help": self._show_help_menu,
+            "menu:accounts": self._show_accounts_menu_callback,
             "add_account": self.add_account_start,
             "run_analysis": self._process_run_analysis,
             "refresh_status": self._show_status_menu,
         }
         if data in route_map:
             await route_map[data](query)
-            return
-
-        if data == "menu:accounts":
-            await self._show_accounts_menu(query, user)
             return
 
         if data.startswith("select_account:"):
@@ -3103,6 +3049,10 @@ class PC28Bot:
         else:
             logger.log_error(user, "未知回调", data)
 
+    async def _show_accounts_menu_callback(self, query):
+        user = query.from_user.id
+        await self._show_accounts_menu(query, user)
+
     def _get_amount_menu_text_and_kb(self, phone):
         acc = self.account_manager.get_account(phone)
         if not acc:
@@ -3133,7 +3083,8 @@ class PC28Bot:
             [InlineKeyboardButton("✅ 止盈金额", callback_data=f"amount_set:stop_win:{phone}"),
              InlineKeyboardButton("🔄 恢复余额", callback_data=f"amount_set:resume_balance:{phone}")],
             [InlineKeyboardButton("📈 动态投注比例", callback_data=f"dynamic_ratio:{phone}")],
-            [InlineKeyboardButton("🔙 返回账户详情", callback_data=f"select_account:{phone}")]
+            [InlineKeyboardButton("🔙 返回账户详情", callback_data=f"select_account:{phone}")],
+            [InlineKeyboardButton("🏠 返回主菜单", callback_data="menu:main")]
         ]
         return text, InlineKeyboardMarkup(kb)
 
@@ -3143,9 +3094,10 @@ class PC28Bot:
             [InlineKeyboardButton("🎯 智能预测", callback_data="menu:prediction")],
             [InlineKeyboardButton("📊 系统状态", callback_data="menu:status")],
             [InlineKeyboardButton("❓ 帮助", callback_data="menu:help")],
-            [InlineKeyboardButton("📖 使用手册", url=Config.MANUAL_LINK)]
+            [InlineKeyboardButton("📖 使用手册", url=Config.MANUAL_LINK)],
+            [InlineKeyboardButton("🔄 刷新菜单", callback_data="menu:main")]
         ]
-        text = "🎮 *PC28 智能投注系统*\n\n基于杀组算法 | AI辅助验证 | 投注延迟模式 | 多币种支持\n\n请选择操作："
+        text = "🎮 *PC28 智能投注系统*\n\n基于杀组算法 | AI辅助验证 | 固定15秒投注延迟 | 多币种支持\n\n请选择操作："
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _show_accounts_menu(self, query, user):
@@ -3162,13 +3114,30 @@ class PC28Bot:
         if accounts:
             for acc in accounts:
                 kb.append([InlineKeyboardButton(f"{acc.get_display_name()}", callback_data=f"select_account:{acc.phone}")])
-        kb.append([InlineKeyboardButton("🔙 返回", callback_data="menu:main")])
+        kb.append([InlineKeyboardButton("🔙 返回主菜单", callback_data="menu:main")])
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    async def _show_accounts_menu_from_message(self, message, user):
+        accounts = self.account_manager.get_user_accounts(user)
+        kb = []
+        if not accounts:
+            text = "📭 您还没有添加账户"
+        else:
+            text = "📱 *您的账户列表*\n\n"
+            for acc in accounts:
+                status = "✅" if acc.is_logged_in else "❌"
+                text += f"{status} {acc.get_display_name()} ({acc.currency})\n"
+        kb.append([InlineKeyboardButton("➕ 添加账户", callback_data="add_account")])
+        if accounts:
+            for acc in accounts:
+                kb.append([InlineKeyboardButton(f"{acc.get_display_name()}", callback_data=f"select_account:{acc.phone}")])
+        kb.append([InlineKeyboardButton("🔙 返回主菜单", callback_data="menu:main")])
+        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _show_prediction_menu(self, query):
         kb = [
             [InlineKeyboardButton("🔮 运行预测", callback_data="run_analysis")],
-            [InlineKeyboardButton("🔙 返回", callback_data="menu:main")]
+            [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu:main")]
         ]
         await query.edit_message_text("🎯 *预测分析菜单*\n\n使用杀组算法 | AI辅助验证", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
@@ -3208,6 +3177,7 @@ class PC28Bot:
             mark = "✅ " if currency == current else ""
             kb.append([InlineKeyboardButton(f"{mark}{currency}", callback_data=f"set_currency:{phone}:{currency}")])
         kb.append([InlineKeyboardButton("🔙 返回账户详情", callback_data=f"select_account:{phone}")])
+        kb.append([InlineKeyboardButton("🏠 返回主菜单", callback_data="menu:main")])
         
         text = f"""
 💱 *投注币种设置*
@@ -3311,8 +3281,6 @@ class PC28Bot:
             await self._show_account_detail(query, user, phone, context)
         elif action == "setkill":
             await self._show_kill_selection(query, phone)
-        elif action == "set_bet_delay":
-            await self.bet_delay_start(query, context)
         else:
             await query.edit_message_text("❌ 未知操作", parse_mode='Markdown')
 
@@ -3345,7 +3313,8 @@ class PC28Bot:
             [InlineKeyboardButton("🔵 大单", callback_data=f"set_kill:大单:{phone}"),
              InlineKeyboardButton("🟡 大双", callback_data=f"set_kill:大双:{phone}")],
             [InlineKeyboardButton("🗑️ 清除自选杀组", callback_data=f"clear_kill:{phone}")],
-            [InlineKeyboardButton("🔙 返回账户详情", callback_data=f"select_account:{phone}")]
+            [InlineKeyboardButton("🔙 返回账户详情", callback_data=f"select_account:{phone}")],
+            [InlineKeyboardButton("🏠 返回主菜单", callback_data="menu:main")]
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
@@ -3381,7 +3350,7 @@ class PC28Bot:
             for g in groups[:10]:
                 icon = "📢" if g.is_channel else "👥"
                 kb.append([InlineKeyboardButton(f"{icon} {g.name[:30]}", callback_data=f"set_group:{g.id}")])
-            kb.append([InlineKeyboardButton("🔙 返回", callback_data=f"select_account:{phone}")])
+            kb.append([InlineKeyboardButton("🔙 返回账户详情", callback_data=f"select_account:{phone}")])
             await query.edit_message_text("📋 *选择游戏群:*", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
         except Exception as e:
             logger.log_error(0, f"获取群组列表失败 {phone}", e)
@@ -3404,7 +3373,7 @@ class PC28Bot:
             for g in groups[:10]:
                 icon = "📢" if g.is_channel else "👥"
                 kb.append([InlineKeyboardButton(f"{icon} {g.name[:30]}", callback_data=f"set_pred_group:{g.id}")])
-            kb.append([InlineKeyboardButton("🔙 返回", callback_data=f"select_account:{phone}")])
+            kb.append([InlineKeyboardButton("🔙 返回账户详情", callback_data=f"select_account:{phone}")])
             await query.edit_message_text("📋 *选择预测播报群:*", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
         except Exception as e:
             logger.log_error(0, f"获取群组列表失败 {phone}", e)
@@ -3448,7 +3417,8 @@ class PC28Bot:
         kb = []
         for name in strategies.keys():
             kb.append([InlineKeyboardButton(name, callback_data=f"set_strategy:{phone}:{name}")])
-        kb.append([InlineKeyboardButton("🔙 返回", callback_data=f"select_account:{phone}")])
+        kb.append([InlineKeyboardButton("🔙 返回账户详情", callback_data=f"select_account:{phone}")])
+        kb.append([InlineKeyboardButton("🏠 返回主菜单", callback_data="menu:main")])
         await query.edit_message_text("📊 *选择投注策略:*", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _show_scheme_selection(self, query, phone):
@@ -3456,7 +3426,8 @@ class PC28Bot:
         kb = []
         for name in schemes.keys():
             kb.append([InlineKeyboardButton(name, callback_data=f"set_scheme:{phone}:{name}")])
-        kb.append([InlineKeyboardButton("🔙 返回", callback_data=f"select_account:{phone}")])
+        kb.append([InlineKeyboardButton("🔙 返回账户详情", callback_data=f"select_account:{phone}")])
+        kb.append([InlineKeyboardButton("🏠 返回主菜单", callback_data="menu:main")])
         await query.edit_message_text("🎯 *选择投注方案:*", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _process_set_strategy(self, query, user, phone, strategy):
@@ -3492,11 +3463,11 @@ class PC28Bot:
 • 昵称: {acc.display_name or '无'}
 • 登录状态: {'✅ 已登录' if acc.is_logged_in else '❌ 未登录'}
 • 投注币种: {acc.currency}
+• 投注延迟: 固定15秒
 
 *状态:*
 • 自动投注: {'✅ 开启' if acc.auto_betting else '❌ 关闭'}
 • 预测播报: {'✅ 开启' if acc.prediction_broadcast else '❌ 关闭'}
-• 投注延迟: {acc.bet_delay_seconds}秒
 • 播报内容: {'双组' if acc.prediction_content=='double' else '杀组'}
 
 *投注设置:*
@@ -3632,6 +3603,7 @@ class PC28Bot:
 • 已登录: {logged}
 • 自动投注: {auto}
 • 预测播报: {broadcast}
+• 投注延迟: 固定15秒
 
 *盈利统计*
 • 总盈利: {format_amount(total_profit, 'KKCOIN')}
@@ -3644,7 +3616,7 @@ class PC28Bot:
 • 失败投注: {sched_stats['game_stats']['failed_bets']}
         """
         kb = [[InlineKeyboardButton("🔄 刷新", callback_data="refresh_status")],
-              [InlineKeyboardButton("🔙 返回", callback_data="menu:main")]]
+              [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu:main")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _show_help_menu(self, query):
@@ -3656,7 +3628,7 @@ class PC28Bot:
 • 添加账户：在“账户管理”中点击“➕ 添加账户”，输入手机号即可。
 • 登录：在账户列表中选择账户，点击“🔐 登录”。
 • 设置群组：进入账户详情，点击“💬 游戏群”或“📢 播报群”从列表中选择。
-• 投注延迟设置：点击“⏱️ 投注延迟”，设置0-30秒的投注延迟时间。
+• 投注延迟：固定15秒，无需设置。
 • 币种设置：点击“💱 投注币种”，选择 KKCOIN/USDT/CNY。
 • 投注设置：在“投注设置”区域选择方案、策略、金额、追号。
 • 播报设置：在“播报设置”区域选择播报群和播报内容（双组/杀组）。
@@ -3666,10 +3638,7 @@ class PC28Bot:
 • 手动投注：在游戏群发送“类型 金额”即可，如“大 10000”。
 
 *投注延迟说明* ⏱️
-投注延迟是指检测到新期号后，等待指定秒数再执行投注。
-- 0秒：立即投注
-- 1-5秒：推荐设置，避开高峰期
-- 5-10秒：较保守设置
+系统固定使用15秒投注延迟，检测到新期号后等待15秒再执行投注，确保避开高峰期。
 
 *多币种支持* 💱
 系统支持三种币种：
@@ -3697,7 +3666,7 @@ class PC28Bot:
 
 如有问题，请联系管理员。
         """
-        kb = [[InlineKeyboardButton("🔙 返回", callback_data="menu:main")]]
+        kb = [[InlineKeyboardButton("🔙 返回主菜单", callback_data="menu:main")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _process_run_analysis(self, query):
@@ -3731,7 +3700,7 @@ class PC28Bot:
 • 硅基流动AI辅助验证
         """
         kb = [[InlineKeyboardButton("🔄 刷新预测", callback_data="run_analysis")],
-              [InlineKeyboardButton("🔙 返回预测菜单", callback_data="menu:prediction")]]
+              [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu:main")]]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _cmd_logout_inline(self, query, user, phone, context):
@@ -3919,7 +3888,7 @@ def main():
     print("""
 ========================================
 PC28自动投注系统
-基于杀组算法 | AI辅助验证 | 投注延迟模式 | 多币种支持
+基于杀组算法 | AI辅助验证 | 固定15秒投注延迟 | 多币种支持
 支持币种: KKCOIN / USDT / CNY
 ========================================
 启动中...
