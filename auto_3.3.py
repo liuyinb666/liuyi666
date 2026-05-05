@@ -136,6 +136,7 @@ def increment_qihao(current_qihao: str) -> str:
         except: return current_qihao + "1"
 
 def format_amount(amount: float, currency: str) -> str:
+    """根据币种格式化金额显示"""
     symbol = Config.CURRENCY_SYMBOLS.get(currency, "")
     if currency == "KKCOIN":
         return f"{int(amount):,}{symbol}"
@@ -145,6 +146,7 @@ def format_amount(amount: float, currency: str) -> str:
         return f"{amount:.2f}{symbol}"
 
 def parse_amount_from_text(text: str, currency: str) -> Optional[float]:
+    """从文本中解析金额（支持多种格式）"""
     patterns = [
         r'([\d,]+\.?\d*)\s*' + re.escape(Config.CURRENCY_SYMBOLS.get(currency, currency)),
         r'([\d,]+\.?\d*)\s*' + currency,
@@ -237,70 +239,57 @@ SUM_TO_COMBO = {
     21: "大单", 22: "大双", 23: "大单", 24: "大双", 25: "大单", 26: "大双", 27: "大单"
 }
 
-# ==================== 新算法：PC28杀组预测器 ====================
-class PC28KillGroupPredictor:
-    """
-    基于提取的核心算法：PC28杀组预测器
-    
-    算法原理：
-    1. 尾数 → 形态映射（0-9对应四个形态）
-    2. 加权计算固定和（基于历史形态参数）
-    3. 生成小数并取尾数
-    4. 杀组判断（同形态取对立面，不同形态取高频）
-    5. 自适应网格搜索优化参数
-    6. 遗漏值调整 + 市场状态判断
-    """
-    
-    TAIL_TO_CATEGORY = {
-        0: "小双", 1: "小单", 2: "小双", 3: "小单", 4: "小双",
-        5: "大单", 6: "大双", 7: "大单", 8: "大双", 9: "大单"
-    }
-    
-    OPPOSITE = {
-        "大单": "小双",
-        "大双": "小单",
-        "小单": "大双",
-        "小双": "大单"
-    }
-    
-    PARAM_RANGES = {
-        "大单": (10, 17),
-        "小单": (10, 17),
-        "大双": (11, 17),
-        "小双": (11, 17)
-    }
-    
+# ==================== PC28杀组算法预测器 ====================
+class PC28RulePredictor:
     def __init__(self):
+        # 尾数 → 形态映射
+        self.tail_to_category = {
+            0: "小双", 1: "小单", 2: "小双", 3: "小单", 4: "小双",
+            5: "大单", 6: "大双", 7: "大单", 8: "大双", 9: "大单"
+        }
+        # 对立面
+        self.opposite = {
+            "大单": "小双",
+            "大双": "小单",
+            "小单": "大双",
+            "小双": "大单"
+        }
+        # 候选参数范围
+        self.param_ranges = {
+            "大单": (10, 17),
+            "小单": (10, 17),
+            "大双": (11, 17),
+            "小双": (11, 17)
+        }
+        self.combos = COMBOS
+        # 全局连错计数
         self.consecutive_loss = 0
         self.max_consecutive_loss = 1
-        self.best_params = {"大单": 12, "小单": 13, "大双": 14, "小双": 15}
-        self.best_score = 0
-        self.prediction_history = []
-        
+
     def get_category(self, total: int) -> str:
         size = "大" if total >= 14 else "小"
         oe = "单" if total % 2 == 1 else "双"
         return size + oe
-    
-    def get_two_digits(self, decimal: float) -> Tuple[int, int]:
+
+    def get_two_digits(self, decimal: float) -> tuple:
         s = str(decimal)[2:]
         if len(s) >= 2:
             result = s[:2]
         else:
             result = s + "0"
         return int(result[0]), int(result[1])
-    
+
     def get_omission(self, category: str, history: List[Dict]) -> int:
         for i, h in enumerate(history):
             if h.get("category") == category:
                 return i
         return len(history)
-    
-    def get_market_state(self, history: List[Dict]) -> Tuple[str, int]:
+
+    def get_market_state(self, history: List[Dict]) -> tuple:
         if len(history) < 6:
             return "震荡", 3
         
-        categories = [h.get("category") for h in history[:6] if h.get("category")]
+        categories = [h.get("category") for h in history[:6]]
         streak = 1
         for i in range(1, len(categories)):
             if categories[i] == categories[0]:
@@ -312,13 +301,11 @@ class PC28KillGroupPredictor:
             return "趋势", 5
         else:
             return "震荡", 3
-    
-    def predict_kill(self, history: List[Dict], params: Dict = None) -> Tuple[Optional[str], str, int]:
+
+    def predict_kill_with_params(self, history: List[Dict], params: Dict) -> Optional[tuple]:
+        """杀组预测"""
         if len(history) < 5:
-            return None, "数据不足", 0
-        
-        if params is None:
-            params = self.best_params
+            return None
         
         latest = history[0]
         
@@ -334,10 +321,7 @@ class PC28KillGroupPredictor:
             omission = self.get_omission(h.get("category", ""), history[1:])
             adjust = 1 + min(omission, 10) * 0.03
             
-            param_key = h.get("category", "小双")
-            param_value = params.get(param_key, 12)
-            
-            fixed_sum += param_value * w * adjust
+            fixed_sum += params.get(h.get("category", ""), 12) * w * adjust
             weight_sum += w * adjust
         
         fixed_sum = fixed_sum / weight_sum if weight_sum > 0 else 0
@@ -346,39 +330,40 @@ class PC28KillGroupPredictor:
         decimal = raw - int(raw)
         
         tail1, tail2 = self.get_two_digits(decimal)
-        cat1 = self.TAIL_TO_CATEGORY.get(tail1, "小双")
-        cat2 = self.TAIL_TO_CATEGORY.get(tail2, "小双")
+        cat1 = self.tail_to_category[tail1]
+        cat2 = self.tail_to_category[tail2]
         
+        # 杀组逻辑
         if cat1 == cat2:
-            kill = self.OPPOSITE.get(cat1, "小双")
+            kill = self.opposite[cat1]
         else:
+            # 统计近期频率，杀出现多的(追冷)
             freq1 = sum(1 for h in history[1:10] if h.get("category") == cat1)
             freq2 = sum(1 for h in history[1:10] if h.get("category") == cat2)
             kill = cat1 if freq1 >= freq2 else cat2
         
         return kill, market_state, window_size
-    
+
     def evaluate_params(self, history: List[Dict], params: Dict) -> float:
         hits = 0
         total = 0
         for i in range(len(history) - 6):
             train = history[i+1:i+7]
             actual = history[i]
-            if len(train) < 5:
-                continue
-            result = self.predict_kill(train, params)
+            result = self.predict_kill_with_params(train, params)
             if result:
                 kill, _, _ = result
-                if kill and actual.get("category") != kill:
+                if actual.get("category") != kill:
                     hits += 1
-                total += 1
+            total += 1
         return hits / total if total > 0 else 0
-    
-    def adaptive_grid_search(self, history: List[Dict], iterations: int = 40) -> Tuple[Dict, float]:
+
+    def adaptive_grid_search(self, history: List[Dict], iterations: int = 40) -> tuple:
+        """自适应网格搜索最优参数"""
         best_params = {"大单": 12, "小单": 13, "大双": 14, "小双": 15}
         best_score = -1
         
-        logger.log_analysis("🔍 自适应网格搜索中...")
+        logger.log_analysis("自适应网格搜索中...")
         
         for _ in range(iterations // 2):
             params = {
@@ -400,82 +385,99 @@ class PC28KillGroupPredictor:
                 "小双": best_params["小双"] + random.randint(-2, 2)
             }
             for k in params:
-                params[k] = max(self.PARAM_RANGES[k][0], min(self.PARAM_RANGES[k][1], params[k]))
+                params[k] = max(self.param_ranges[k][0], min(self.param_ranges[k][1], params[k]))
             
             score = self.evaluate_params(history, params)
             if score > best_score:
                 best_score = score
                 best_params = params.copy()
         
-        logger.log_analysis(f"✅ 最优参数: 大单={best_params['大单']}, 小单={best_params['小单']}, "
-                           f"大双={best_params['大双']}, 小双={best_params['小双']}, 胜率={best_score*100:.1f}%")
-        
-        self.best_params = best_params
-        self.best_score = best_score
+        logger.log_analysis(f"最优参数: 大单={best_params['大单']}, 小单={best_params['小单']}, 大双={best_params['大双']}, 小双={best_params['小双']}, 胜率={best_score*100:.1f}%")
         return best_params, best_score
+
+    def get_rule_based_predictions(self, history: List[Dict]) -> Optional[Dict]:
+        """获取基于杀组算法的预测结果"""
+        if len(history) < 10:
+            logger.log_analysis(f"历史数据不足10期，当前{len(history)}期")
+            return None
+        
+        # 确保历史数据有category字段和total字段
+        processed_history = []
+        for h in history:
+            processed = h.copy()
+            if 'category' not in processed and processed.get('total') is not None:
+                processed['category'] = self.get_category(processed.get('total', 0))
+            if 'total' not in processed and processed.get('sum') is not None:
+                processed['total'] = processed.get('sum')
+            if 'total' not in processed and processed.get('opennum') is not None:
+                try:
+                    processed['total'] = int(processed.get('opennum', 0))
+                except:
+                    processed['total'] = 0
+            processed_history.append(processed)
+        
+        # 连错惩罚处理
+        if self.consecutive_loss >= self.max_consecutive_loss:
+            logger.log_analysis(f"⚠️ 连错{self.consecutive_loss}期，触发惩罚(参数范围减半)")
+            for k in self.param_ranges:
+                mid = (self.param_ranges[k][0] + self.param_ranges[k][1]) / 2
+                self.param_ranges[k] = (max(10, mid - 2), min(17, mid + 2))
+        else:
+            self.param_ranges = {
+                "大单": (10, 17),
+                "小单": (10, 17),
+                "大双": (11, 17),
+                "小双": (11, 17)
+            }
+        
+        # 自适应参数搜索
+        params, best_score = self.adaptive_grid_search(processed_history[:30] if len(processed_history) >= 30 else processed_history)
+        
+        # 获取杀组预测
+        result = self.predict_kill_with_params(processed_history, params)
+        if not result:
+            return None
+        
+        kill, market_state, window_size = result
+        
+        # 构建主推和候选组合（排除杀组）
+        main_combos = [c for c in self.combos if c != kill]
+        main = main_combos[0] if main_combos else self.combos[0]
+        candidate = main_combos[1] if len(main_combos) > 1 else main_combos[0] if main_combos else self.combos[0]
+        
+        # 计算置信度
+        confidence = min(95, int(50 + best_score * 40))
+        
+        # 生成预测结果
+        prediction = {
+            'main': main,
+            'candidate': candidate,
+            'kill': kill,
+            'confidence': confidence,
+            'kill_confidence': int(best_score * 100),
+            'market_state': market_state,
+            'window_size': window_size,
+            'params': params,
+            'algo_details': [
+                {"name": "杀组算法", "kill": kill, "confidence": int(best_score * 100)},
+                {"name": "自适应参数", "params": params}
+            ],
+            'special_numbers': [random.randint(0, 27) for _ in range(4)],
+            'jump_risk': f"杀组[{kill}]，基于{window_size}期窗口，连错惩罚机制运行中"
+        }
+        
+        logger.log_prediction(0, "杀组算法预测完成",
+                              f"主推:{main} 候选:{candidate} 杀组:{kill} 置信度:{confidence}% 胜率:{best_score*100:.1f}%")
+        
+        return prediction
     
-    def update_consecutive_loss(self, is_hit: bool):
-        if is_hit:
+    def update_result(self, actual_kill_correct: bool):
+        """更新连错计数（由外部调用）"""
+        if actual_kill_correct:
             self.consecutive_loss = 0
         else:
             self.consecutive_loss += 1
-    
-    def apply_penalty_range(self):
-        if self.consecutive_loss >= self.max_consecutive_loss:
-            for k in self.PARAM_RANGES:
-                mid = (self.PARAM_RANGES[k][0] + self.PARAM_RANGES[k][1]) / 2
-                self.PARAM_RANGES[k] = (max(10, mid - 2), min(17, mid + 2))
-        else:
-            self.PARAM_RANGES["大单"] = (10, 17)
-            self.PARAM_RANGES["小单"] = (10, 17)
-            self.PARAM_RANGES["大双"] = (11, 17)
-            self.PARAM_RANGES["小双"] = (11, 17)
-    
-    def predict(self, history: List[Dict]) -> Dict:
-        if len(history) < 10:
-            logger.log_analysis(f"历史数据不足10期，当前{len(history)}期，使用默认参数")
-            kill, market_state, window_size = self.predict_kill(history)
-        else:
-            self.apply_penalty_range()
-            best_params, best_score = self.adaptive_grid_search(history[:50])
-            self.best_params = best_params
-            self.best_score = best_score
-            kill, market_state, window_size = self.predict_kill(history, best_params)
-        
-        if kill is None:
-            kill = random.choice(COMBOS)
-            market_state = "默认"
-            window_size = 5
-        
-        confidence = min(90, 50 + int(self.best_score * 40)) if self.best_score > 0 else 60
-        
-        return {
-            'kill': kill,
-            'market_state': market_state,
-            'window_size': window_size,
-            'params': self.best_params,
-            'confidence': confidence,
-            'algo_details': [
-                {"name": "自适应网格搜索", "params": self.best_params, "score": self.best_score},
-                {"name": "加权固定和公式", "formula": "fixed_sum / (latest_total × π)"},
-                {"name": "尾数映射杀组", "logic": "同形态取对立面，不同形态取高频"}
-            ]
-        }
-    
-    def learn(self, actual_combo: str, predicted_kill: str):
-        is_hit = (actual_combo != predicted_kill)
-        self.update_consecutive_loss(is_hit)
-        
-        record = {
-            'time': datetime.now().isoformat(),
-            'predicted_kill': predicted_kill,
-            'actual': actual_combo,
-            'is_hit': is_hit,
-            'consecutive_loss': self.consecutive_loss
-        }
-        self.prediction_history.append(record)
-        if len(self.prediction_history) > 100:
-            self.prediction_history = self.prediction_history[-100:]
+        logger.log_analysis(f"杀组结果更新: {'正确' if actual_kill_correct else '错误'}, 连错计数={self.consecutive_loss}")
 
 # ==================== 硅基流动AI客户端 ====================
 class SiliconFlowAIClient:
@@ -489,114 +491,115 @@ class SiliconFlowAIClient:
         self._last_prediction = None
         self._last_qihao = None
         self._last_prompt_hash = None
-        self.kill_predictor = PC28KillGroupPredictor()
+        self.rule_predictor = PC28RulePredictor()
     
-    def _build_prompt(self, history: List[Dict], kill_result: Dict) -> str:
-        if not kill_result:
+    def _build_rule_based_prompt(self, history: List[Dict], rule_result: Dict) -> str:
+        if not rule_result:
             return self._build_fallback_prompt(history)
         
-        combos_10 = [h.get('combo', '') for h in history[:10] if h.get('combo')]
-        sums_10 = [h.get('sum', 0) for h in history[:10] if h.get('sum') is not None]
+        combos_10 = [h.get('category', '') for h in history[:10] if h.get('category')]
+        sums_10 = [h.get('total', 0) for h in history[:10] if h.get('total') is not None]
         
         combo_count = Counter(combos_10)
         
-        current_streak = 1
-        if combos_10:
-            for i in range(1, len(combos_10)):
-                if combos_10[i] == combos_10[0]:
-                    current_streak += 1
-                else:
-                    break
-        
-        prompt = f"""你是PC28彩票预测验证专家。以下是基于自适应网格搜索算法的预测结果，请验证其合理性。
+        prompt = f"""你是PC28彩票预测验证专家。以下是基于杀组算法的预测结果，请验证其合理性。
 
-【自适应网格搜索算法预测结果】
-- 预测杀组：{kill_result['kill']}
-- 市场状态：{kill_result['market_state']}
-- 分析窗口：{kill_result['window_size']}期
-- 最优参数：大单={kill_result['params']['大单']}, 小单={kill_result['params']['小单']}, 
-          大双={kill_result['params']['大双']}, 小双={kill_result['params']['小双']}
-- 算法置信度：{kill_result['confidence']}%
+【杀组算法预测结果】
+- 最终杀组（必排除）：{rule_result['kill']}（置信度{rule_result['kill_confidence']}%）
+- 核心主攻组合：{rule_result['main']}
+- 高概率稳防组合：{rule_result['candidate']}
+- 预测置信度：{rule_result['confidence']}%
+- 市场状态：{rule_result.get('market_state', '震荡')}
+- 分析窗口：{rule_result.get('window_size', 3)}期
 
 【近期走势数据（最近10期）】
 - 组合序列：{" → ".join(combos_10[:10])}
 - 和值序列：{sums_10[:10]}
-- 当前连开：{current_streak}期（{combos_10[0] if combos_10 else '无'}）
 - 组合频次：{dict(combo_count)}
 
-【算法说明】
-1. 基于历史形态的加权均值生成伪随机小数
-2. 提取小数点后两位数字映射为形态
-3. 通过频率统计或对立面规则预测最不可能出现的组合
-4. 自适应参数搜索动态优化模型参数
+【杀组算法说明】
+1. 基于尾数映射: 0-9尾数映射到大小单双
+2. 加权滑动窗口计算，使用遗漏值调整权重
+3. 双尾数映射杀组: 相同则取对立面，不同则追冷
+4. 自适应参数搜索优化
 
 【验证任务】
-请基于PC28开奖规律，验证上述预测是否合理，并输出JSON格式结果：
+请基于PC28开奖规律，验证上述杀组预测是否合理，并输出JSON格式结果：
 
 {{
     "validation": "合理/需调整/不合理",
-    "kill_confirm": "确认的杀组组合",
+    "main_confirm": [确认的主攻组合，保持原顺序],
+    "candidate_confirm": "确认的稳防组合",
+    "kill_confirm": "确认的杀组",
     "adjustment_reason": "调整原因（如无需调整填'无'）",
     "final_confidence": 整数置信度(40-95)
 }}
 
 注意：
 - 如果杀组近期出现频次≥2次，考虑调整
-- 如果杀组连续3期未出，可以考虑保持
+- 如果主攻组合连续3期未出，考虑加强
 - 保持输出简洁，仅输出JSON"""
         
         return prompt
     
     def _build_fallback_prompt(self, history: List[Dict]) -> str:
-        combos_10 = [h.get('combo', '') for h in history[:10] if h.get('combo')]
-        sums_10 = [h.get('sum', 0) for h in history[:10] if h.get('sum') is not None]
+        combos_10 = [h.get('category', '') for h in history[:10] if h.get('category')]
+        sums_10 = [h.get('total', 0) for h in history[:10] if h.get('total') is not None]
         
         combo_count = Counter(combos_10)
         
-        prompt = f"""你是PC28彩票预测专家。基于以下数据预测下一期最不可能出现的组合（杀组）。
+        prompt = f"""你是PC28彩票预测专家。基于以下数据预测下一期。
 
 【最近10期数据】
 组合序列：{" → ".join(combos_10[:10])}
 和值序列：{sums_10[:10]}
 组合频次：{dict(combo_count)}
 
-【预测规则】
-1. 近期出现次数最多的组合最可能被杀
-2. 连开≥3期的组合优先考虑杀
-3. 冷门组合（10期出现≤1次）通常不杀
+【预测规则优先级】
+1. 连开≥3期强制排除该组合
+2. 短期冷号（10期出现≤1次）优先预测
+3. 大小/单双走势一致性≥80%时预测反转
 
 【输出格式】
-仅输出JSON：{{"kill":"组合","confidence":整数}}
+仅输出JSON：{{"main":"组合","candidate":"组合","kill":"组合","confidence":整数}}
 可选组合：小单、小双、大单、大双
 置信度范围：40-90"""
         
         return prompt
     
-    def _parse_ai_response(self, text: str) -> Tuple[Optional[str], Optional[int]]:
+    def _parse_ai_response(self, text: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
         try:
             start = text.find('{')
             end = text.rfind('}') + 1
             if start == -1 or end == 0:
-                return None, None
+                return None, None, None, None
             
             json_str = text[start:end]
             data = json.loads(json_str)
             
+            main = data.get("main") or data.get("main_confirm")
+            candidate = data.get("candidate") or data.get("candidate_confirm")
             kill = data.get("kill") or data.get("kill_confirm")
             confidence = data.get("confidence") or data.get("final_confidence")
             
-            if not kill or kill not in COMBOS:
-                return None, None
+            if not main or not candidate or not kill:
+                return None, None, None, None
+            
+            if main not in COMBOS or candidate not in COMBOS or kill not in COMBOS:
+                return None, None, None, None
+            
+            if main == candidate or main == kill or candidate == kill:
+                return None, None, None, None
             
             if not isinstance(confidence, (int, float)):
                 confidence = 60
             
-            return kill, int(confidence)
+            return main, candidate, kill, int(confidence)
         except Exception as e:
             logger.log_error(0, "解析AI响应失败", e)
-            return None, None
+            return None, None, None, None
     
-    async def predict(self, history: List[Dict], qihao: str = None) -> Tuple[Optional[str], Optional[int], Optional[str], Optional[int]]:
+    async def predict(self, history: List[Dict], qihao: str = None) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
         if qihao and self._last_qihao == qihao and self._last_prediction:
             logger.log_api("使用缓存的预测结果", f"期号: {qihao}")
             return self._last_prediction
@@ -605,39 +608,42 @@ class SiliconFlowAIClient:
             if qihao and self._last_qihao == qihao and self._last_prediction:
                 return self._last_prediction
             
-            kill_result = self.kill_predictor.predict(list(history)[:50])
-            logger.log_analysis(f"杀组算法计算结果: 杀组{kill_result['kill']}, 置信度{kill_result['confidence']}%")
+            rule_predictor = PC28RulePredictor()
+            rule_result = rule_predictor.get_rule_based_predictions(list(history)[:30])
             
-            prompt = self._build_prompt(history, kill_result)
-            ai_kill, ai_confidence = await self._call_ai_with_prompt(prompt, qihao)
-            
-            if ai_kill is not None:
-                logger.log_prediction(0, "AI验证规则结果", f"AI确认杀组: {ai_kill}")
-                final_kill = ai_kill
-                final_confidence = ai_confidence
+            if rule_result:
+                logger.log_analysis(f"杀组算法计算结果: 主推{rule_result['main']}, 杀组{rule_result['kill']}")
+                
+                prompt = self._build_rule_based_prompt(history, rule_result)
+                
+                ai_result = await self._call_ai_with_prompt(prompt, qihao, history)
+                
+                if ai_result[0] is not None:
+                    logger.log_prediction(0, "AI验证规则结果", f"AI确认: 主推{ai_result[0]}, 杀组{ai_result[2]}")
+                    return ai_result
+                else:
+                    main = rule_result['main']
+                    candidate = rule_result['candidate']
+                    kill = rule_result['kill']
+                    confidence = rule_result['confidence']
+                    logger.log_analysis(f"AI验证失败，使用规则结果: 主推{main}, 候选{candidate}, 杀组{kill}")
+                    return main, candidate, kill, confidence
             else:
-                final_kill = kill_result['kill']
-                final_confidence = kill_result['confidence']
-                logger.log_analysis(f"AI验证失败，使用算法结果: 杀组{final_kill}")
-            
-            remaining = [c for c in COMBOS if c != final_kill]
-            main = remaining[0] if remaining else COMBOS[0]
-            candidate = remaining[1] if len(remaining) > 1 else main
-            
-            result = (main, final_confidence, final_kill, final_confidence)
-            
-            if qihao:
-                self._last_qihao = qihao
-                self._last_prediction = result
-            return result
+                logger.log_analysis("规则计算失败，回退到纯AI预测")
+                prompt = self._build_fallback_prompt(history)
+                return await self._call_ai_with_prompt(prompt, qihao, history)
     
-    async def _call_ai_with_prompt(self, prompt: str, qihao: str) -> Tuple[Optional[str], Optional[int]]:
+    async def _call_ai_with_prompt(self, prompt: str, qihao: str, history: List[Dict]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
         prompt_hash = hashlib.md5(prompt.encode()).hexdigest()
         
         if prompt_hash in self._active_requests:
             logger.log_api("检测到重复请求", f"等待已有请求完成，hash={prompt_hash[:8]}")
             try:
-                return await asyncio.wait_for(self._active_requests[prompt_hash], timeout=60)
+                result = await asyncio.wait_for(self._active_requests[prompt_hash], timeout=60)
+                if qihao:
+                    self._last_qihao = qihao
+                    self._last_prediction = result
+                return result
             except asyncio.TimeoutError:
                 del self._active_requests[prompt_hash]
         
@@ -649,17 +655,20 @@ class SiliconFlowAIClient:
             "stream": False
         }
         
-        request_task = asyncio.create_task(self._do_predict(payload, prompt_hash))
+        request_task = asyncio.create_task(self._do_predict(payload, prompt_hash, history))
         self._active_requests[prompt_hash] = request_task
         
         try:
             result = await request_task
+            if qihao:
+                self._last_qihao = qihao
+                self._last_prediction = result
             return result
         finally:
             if prompt_hash in self._active_requests:
                 del self._active_requests[prompt_hash]
     
-    async def _do_predict(self, payload: Dict, prompt_hash: str) -> Tuple[Optional[str], Optional[int]]:
+    async def _do_predict(self, payload: Dict, prompt_hash: str, history: List[Dict]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
         max_retries = 3
         base_delay = 2
         
@@ -689,15 +698,40 @@ class SiliconFlowAIClient:
                                 await asyncio.sleep(base_delay * (2 ** attempt))
             except asyncio.TimeoutError:
                 if attempt == max_retries - 1:
-                    return None, None
+                    return self._get_fallback_from_rule(history)
                 await asyncio.sleep(base_delay * (2 ** attempt))
             except Exception as e:
                 logger.log_error(0, "AI请求异常", e)
                 if attempt == max_retries - 1:
-                    return None, None
+                    return self._get_fallback_from_rule(history)
                 await asyncio.sleep(base_delay)
         
-        return None, None
+        return self._get_fallback_from_rule(history)
+    
+    def _get_fallback_from_rule(self, history: List[Dict]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[int]]:
+        rule_predictor = PC28RulePredictor()
+        rule_result = rule_predictor.get_rule_based_predictions(list(history)[:30])
+        
+        if rule_result:
+            main = rule_result['main']
+            candidate = rule_result['candidate']
+            kill = rule_result['kill']
+            confidence = rule_result['confidence']
+            return main, candidate, kill, confidence
+        
+        combos_20 = [h.get('category') for h in history[:20] if h.get('category')]
+        if combos_20:
+            freq = Counter(combos_20)
+            main = min(freq, key=freq.get)
+            candidates = [c for c in COMBOS if c != main]
+            candidate = random.choice(candidates)
+            kill = max(freq, key=freq.get)
+            return main, candidate, kill, 55
+        
+        main = random.choice(COMBOS)
+        candidate = random.choice([c for c in COMBOS if c != main])
+        kill = random.choice([c for c in COMBOS if c != main and c != candidate])
+        return main, candidate, kill, 50
 
 # ==================== 模型管理器 ====================
 class ModelManager:
@@ -706,7 +740,6 @@ class ModelManager:
             api_key=Config.SILICONFLOW_API_KEY,
             model_name=Config.SILICONFLOW_MODEL
         )
-        self.kill_predictor = PC28KillGroupPredictor()
         self.prediction_history = []
         self.recent_accuracy = deque(maxlen=50)
         self._last_ai_kill = None
@@ -714,15 +747,14 @@ class ModelManager:
         self._predict_lock = asyncio.Lock()
         self._last_predict_result = None
         self._last_predict_qihao = None
+        self.rule_predictor = PC28RulePredictor()
 
     async def save(self):
         async with self._save_lock:
             try:
                 data = {
                     'history': self.prediction_history[-100:],
-                    'last_save': datetime.now().isoformat(),
-                    'best_params': self.kill_predictor.best_params,
-                    'best_score': self.kill_predictor.best_score
+                    'last_save': datetime.now().isoformat()
                 }
                 async with aiofiles.open(Config.MODEL_SAVE_FILE, 'w', encoding='utf-8') as f:
                     await f.write(json.dumps(data, ensure_ascii=False, indent=2))
@@ -740,19 +772,31 @@ class ModelManager:
             if qihao and self._last_predict_qihao == qihao and self._last_predict_result:
                 return self._last_predict_result
 
-            main, confidence, kill, _ = await self.ai_client.predict(list(history), qihao)
+            # 确保历史数据有category字段
+            processed_history = []
+            for h in history:
+                processed = h.copy()
+                if 'category' not in processed and processed.get('total') is not None:
+                    processed['category'] = self.rule_predictor.get_category(processed.get('total', 0))
+                if 'total' not in processed and processed.get('sum') is not None:
+                    processed['total'] = processed.get('sum')
+                processed_history.append(processed)
             
-            if main is None or kill is None:
-                kill_result = self.kill_predictor.predict(list(history)[:50])
-                kill = kill_result['kill']
-                confidence = kill_result['confidence']
-                remaining = [c for c in COMBOS if c != kill]
-                main = remaining[0] if remaining else COMBOS[0]
-                candidate = remaining[1] if len(remaining) > 1 else main
-                logger.log_analysis("使用杀组算法兜底")
+            # 使用杀组算法
+            rule_result = self.rule_predictor.get_rule_based_predictions(processed_history[:30])
+            
+            if rule_result:
+                main = rule_result['main']
+                candidate = rule_result['candidate']
+                kill = rule_result['kill']
+                confidence = rule_result['confidence']
+                logger.log_analysis(f"杀组算法预测: 主推{main}, 候选{candidate}, 杀组{kill}, 置信度{confidence}")
             else:
-                candidate = [c for c in COMBOS if c != main and c != kill]
-                candidate = candidate[0] if candidate else main
+                main = random.choice(COMBOS)
+                candidate = random.choice([c for c in COMBOS if c != main])
+                kill = random.choice([c for c in COMBOS if c != main and c != candidate])
+                confidence = 50
+                logger.log_analysis("杀组算法计算失败，使用随机兜底")
             
             if main == candidate:
                 candidate = random.choice([c for c in COMBOS if c != main])
@@ -765,14 +809,10 @@ class ModelManager:
                 "kill": kill,
                 "confidence": min(95, max(40, confidence)),
                 "algo_details": [
-                    {"name": "自适应网格搜索杀组算法", "kill": kill, "params": self.kill_predictor.best_params},
-                    {"name": "加权固定和公式", "formula": "fixed_sum / (latest_total × π)"},
-                    {"name": "尾数映射+对立面/高频杀组", "logic": "同形态取对立面，不同形态取高频"}
+                    {"name": "杀组算法", "kill": kill},
+                    {"name": "自适应参数搜索", "status": "已执行"}
                 ],
-                "trend_analysis": {
-                    "market_state": "趋势/震荡判断",
-                    "consecutive_loss": self.kill_predictor.consecutive_loss
-                }
+                "trend_analysis": {}
             }
 
             if qihao:
@@ -782,11 +822,11 @@ class ModelManager:
             return result
 
     async def learn(self, prediction: Dict, actual: str, qihao: str, sum_val: int):
+        # 判断杀组是否正确（actual != kill）
+        kill_correct = (actual != prediction.get('kill', ''))
+        self.rule_predictor.update_result(kill_correct)
+        
         is_correct = (actual == prediction['main'] or actual == prediction['candidate'])
-        
-        if prediction.get('kill'):
-            self.kill_predictor.learn(actual, prediction['kill'])
-        
         record = {
             "time": datetime.now().isoformat(),
             "qihao": qihao,
@@ -795,7 +835,8 @@ class ModelManager:
             "kill": prediction.get('kill'),
             "actual": actual,
             "sum": sum_val,
-            "correct": is_correct
+            "correct": is_correct,
+            "kill_correct": kill_correct
         }
         self.prediction_history.append(record)
         self.recent_accuracy.append(1 if is_correct else 0)
@@ -808,7 +849,7 @@ class ModelManager:
         total = sum(1 for r in self.prediction_history if r.get('correct', False)) / len(self.prediction_history) if self.prediction_history else 0
         return {
             'overall': {'recent': recent, 'total': total},
-            'algorithms': {'自适应网格搜索杀组算法': recent}
+            'algorithms': {'杀组算法': recent}
         }
 
     def clear_history(self):
@@ -948,7 +989,7 @@ class PC28API:
             
             return {
                 'qihao': qihao, 'opentime': f"{date_str} {time_str}", 'opennum': str(total) if total else '',
-                'sum': total, 'size': size, 'parity': parity, 'combo': combo,
+                'total': total, 'size': size, 'parity': parity, 'category': combo,
                 'a': a, 'b': b, 'c': c,
                 'parsed_time': self._parse_time(date_str, time_str),
                 'fetch_time': datetime.now().isoformat(),
@@ -999,7 +1040,7 @@ class PC28API:
                 
                 processed.append({
                     'qihao': qihao, 'opentime': f"{date_str} {time_str}", 'opennum': str(total),
-                    'sum': total, 'size': size, 'parity': parity, 'combo': combo,
+                    'total': total, 'size': size, 'parity': parity, 'category': combo,
                     'a': a, 'b': b, 'c': c,
                     'parsed_time': self._parse_time(date_str, time_str),
                     'fetch_time': datetime.now().isoformat(),
@@ -1184,6 +1225,7 @@ class Account:
     listen_delay_seconds: int = 1
     listen_keywords: List[str] = field(default_factory=lambda: ["✅ 投注成功", "投注成功", "@kk28"])
     listen_last_trigger: Optional[str] = None
+    # 多币种字段
     currency: str = Config.DEFAULT_CURRENCY
 
     def get_display_name(self) -> str:
@@ -1626,8 +1668,12 @@ class PredictionBroadcaster:
     async def update_global_predictions(self, prediction, next_qihao, latest):
         last_correct = None
         current_open_qihao = latest.get('qihao')
-        current_sum = latest.get('sum')
-        current_combo = latest.get('combo')
+        current_sum = latest.get('total')
+        if current_sum is None:
+            current_sum = latest.get('sum')
+        current_combo = latest.get('category')
+        if current_combo is None:
+            current_combo = latest.get('combo')
         
         matched_pred = None
         for p in self.global_predictions['predictions']:
@@ -1640,7 +1686,7 @@ class PredictionBroadcaster:
             matched_pred['sum'] = current_sum
             matched_pred['correct'] = (matched_pred['main'] == current_combo or matched_pred['candidate'] == current_combo)
             last_correct = matched_pred['correct']
-            await self.model.learn(matched_pred, current_combo, current_open_qihao, current_sum)
+            await self.model.learn(matched_pred, current_combo, current_open_qihao, current_sum if current_sum else 0)
         
         kill_combo = prediction.get('kill')
         if kill_combo is None:
@@ -1698,7 +1744,7 @@ class PredictionBroadcaster:
                     logger.log_error(0, "并发发送预测异常", res)
 
     def _update_cached_messages(self):
-        lines = ["🤖自适应网格搜索杀组算法 ", "-" * 30, "期号    主推候选  状态  和值"]
+        lines = ["🤖PC28杀组算法 ", "-"*30, "期号    主推候选  状态  和值"]
         for p in self.global_predictions['predictions'][-15:]:
             q = p['qihao'][-4:] if len(p['qihao'])>=4 else p['qihao']
             combo_str = p['main'] + p['candidate']
@@ -1707,7 +1753,7 @@ class PredictionBroadcaster:
             lines.append(f"{q:4s}   {combo_str:4s}   {mark:2s}   {s:>2s}")
         self.global_predictions['cached_double_message'] = "AI双组预测\n```" + "\n".join(lines) + "\n```"
         
-        kill_lines = ["🤖杀组预测（自适应网格搜索）", "-" * 30, "期号    杀组    状态  和值"]
+        kill_lines = ["🤖AI杀组", "-"*30, "期号    杀组    状态  和值"]
         for p in self.global_predictions['predictions'][-15:]:
             q = p['qihao'][-4:] if len(p['qihao'])>=4 else p['qihao']
             kill = p.get('kill_group', '--')
@@ -1715,7 +1761,7 @@ class PredictionBroadcaster:
             mark = "✅" if (p.get('actual') is not None and p['actual'] != kill) else "❌" if (p.get('actual') is not None and p['actual'] == kill) else "⏳"
             s = str(p['sum']) if p['sum'] is not None else "--"
             kill_lines.append(f"{q:4s}   {kill:4s}   {mark:2s}   {s:>2s}")
-        self.global_predictions['cached_kill_message'] = "杀组预测\n```" + "\n".join(kill_lines) + "\n```"
+        self.global_predictions['cached_kill_message'] = "AI杀组预测\n```" + "\n".join(kill_lines) + "\n```"
 
     async def _check_streak(self, phone, group_id, is_correct, last_message_id):
         acc = self.account_manager.get_account(phone)
@@ -1860,16 +1906,20 @@ class BetListener:
         return True, f"监听群组已设置为: {group_name}"
     
     async def set_listen_keywords(self, phone: str, keywords: List[str], user_id: int) -> Tuple[bool, str]:
+        if not keywords:
+            keywords = ["✅ 投注成功", "投注成功", "@kk28"]
         await self.account_manager.update_account(phone, listen_keywords=keywords)
         logger.log_listen(user_id, "设置监听关键词", f"账户:{phone} 关键词:{keywords}")
         return True, f"监听关键词已设置为: {', '.join(keywords)}"
     
-    async def set_listen_delay(self, phone: str, delay_seconds: int, user_id: int) -> Tuple[bool, str]:
-        if delay_seconds < 0:
-            return False, "延迟秒数不能为负数"
-        await self.account_manager.update_account(phone, listen_delay_seconds=delay_seconds)
-        logger.log_listen(user_id, "设置监听延迟", f"账户:{phone} 延迟:{delay_seconds}秒")
-        return True, f"监听延迟已设置为 {delay_seconds} 秒"
+    async def set_listen_delay(self, phone: str, delay: int, user_id: int) -> Tuple[bool, str]:
+        if delay < 1:
+            delay = 1
+        if delay > 30:
+            delay = 30
+        await self.account_manager.update_account(phone, listen_delay_seconds=delay)
+        logger.log_listen(user_id, "设置监听延迟", f"账户:{phone} 延迟:{delay}秒")
+        return True, f"监听延迟已设置为 {delay} 秒"
     
     async def _listen_loop(self, phone: str):
         client = self.account_manager.clients.get(phone)
@@ -2043,7 +2093,9 @@ class GameScheduler:
         last_bet_types = acc.last_bet_types
         if not last_pred or not last_bet_types: 
             return
-        actual_combo = latest_result.get('combo')
+        actual_combo = latest_result.get('category')
+        if actual_combo is None:
+            actual_combo = latest_result.get('combo')
         if not actual_combo: 
             return
         main = last_pred.get('main')
@@ -2606,7 +2658,7 @@ class GlobalScheduler:
                     logger.log_game(f"使用缓存的预测结果: 期号 {qihao}")
                     prediction = self._last_prediction_result
                 else:
-                    logger.log_game(f"开始为新期号 {qihao} 生成预测（自适应网格搜索杀组算法）")
+                    logger.log_game(f"开始为新期号 {qihao} 生成预测（杀组算法）")
                     prediction = await self.model.predict(history, latest)
                     self._last_prediction_result = prediction
                     self._last_prediction_qihao = qihao
@@ -2660,7 +2712,7 @@ class PC28Bot:
 
         self.application = Application.builder().token(Config.BOT_TOKEN).build()
         self._register_handlers()
-        logger.log_system("PC28 Bot（自适应网格搜索杀组算法 - 监听模式 + 多币种支持KKCOIN/USDT/CNY）初始化完成")
+        logger.log_system("PC28 Bot（杀组算法版 - 监听模式 + 多币种支持KKCOIN/USDT/CNY）初始化完成")
 
     def _register_handlers(self):
         self.application.add_handler(CommandHandler("start", self.cmd_start))
@@ -2700,6 +2752,7 @@ class PC28Bot:
         )
         self.application.add_handler(chase_conv)
 
+        # 监听设置会话
         listen_keywords_conv = ConversationHandler(
             entry_points=[CallbackQueryHandler(self.listen_keywords_start, pattern=r'^action:set_listen_keywords:')],
             states={
@@ -2745,8 +2798,7 @@ class PC28Bot:
         ]
         await update.message.reply_text(
             "🎰 *PC28 智能预测投注系统*\n\n"
-            "✨ 欢迎使用！基于自适应网格搜索杀组算法\n"
-            "📊 核心算法：加权固定和 + 尾数映射 + 对立面/高频杀组\n"
+            "✨ 欢迎使用！基于杀组算法\n"
             "🤖 硅基流动AI辅助验证\n"
             "🔍 监听模式：监听到群组投注成功后自动投注\n"
             "💱 多币种支持：KKCOIN / USDT / CNY\n\n"
@@ -2896,6 +2948,7 @@ class PC28Bot:
             await update.message.reply_text(f"❌ 密码验证失败：{error_msg}\n请重新输入密码或点击 /cancel 取消")
             return Config.LOGIN_PASSWORD
 
+    # 追号相关方法
     async def chase_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
@@ -3050,6 +3103,7 @@ class PC28Bot:
 
         return ConversationHandler.END
 
+    # 监听设置相关方法
     async def listen_keywords_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
@@ -3192,6 +3246,7 @@ class PC28Bot:
              InlineKeyboardButton("⚙️ 监听设置", callback_data=f"action:listen_settings:{phone}")],
         ]
         
+        # 币种菜单
         currency_menu = [
             [InlineKeyboardButton("💱 投注币种", callback_data=f"action:setcurrency:{phone}")],
         ]
@@ -3461,7 +3516,7 @@ class PC28Bot:
             [InlineKeyboardButton("❓ 帮助", callback_data="menu:help")],
             [InlineKeyboardButton("📖 使用手册", url=Config.MANUAL_LINK)]
         ]
-        text = "🎮 *PC28 智能投注系统*\n\n基于自适应网格搜索杀组算法 | 加权固定和+尾数映射 | AI辅助验证 | 监听模式 | 多币种支持\n\n请选择操作："
+        text = "🎮 *PC28 智能投注系统*\n\n基于杀组算法 | AI辅助验证 | 监听模式 | 多币种支持\n\n请选择操作："
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _show_accounts_menu(self, query, user):
@@ -3486,7 +3541,7 @@ class PC28Bot:
             [InlineKeyboardButton("🔮 运行预测", callback_data="run_analysis")],
             [InlineKeyboardButton("🔙 返回", callback_data="menu:main")]
         ]
-        await query.edit_message_text("🎯 *预测分析菜单*\n\n使用自适应网格搜索杀组算法 | 加权固定和公式 | 硅基流动AI辅助验证", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        await query.edit_message_text("🎯 *预测分析菜单*\n\n使用杀组算法 | AI辅助验证", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _show_amount_menu_callback(self, query, user, phone, context):
         context.user_data.pop('last_amount_msg', None)
@@ -3696,7 +3751,7 @@ class PC28Bot:
 
     async def _list_games_groups_for_selection(self, query, phone):
         client = self.account_manager.clients.get(phone)
-                if not client:
+        if not client:
             await query.edit_message_text("❌ 客户端未连接", parse_mode='Markdown')
             return
         try:
@@ -3954,43 +4009,43 @@ class PC28Bot:
         if win_7:
             text += f"\n✅ *连赢7期* ({len(win_7)}次)\n"
             for i, r in enumerate(win_7[-5:], 1):
-                start = datetime.fromisoformat(r['start_time']).strftime('%m-%d %H:%M') if isinstance(r['start_time'], str) else r['start_time'].strftime('%m-%d %H:%M')
-                end = datetime.fromisoformat(r['end_time']).strftime('%m-%d %H:%M') if isinstance(r['end_time'], str) else r['end_time'].strftime('%m-%d %H:%M')
+                start = datetime.fromisoformat(r['start_time']).strftime('%m-%d %H:%M')
+                end = datetime.fromisoformat(r['end_time']).strftime('%m-%d %H:%M')
                 text += f"  {i}. {start} → {end}\n"
         
         if win_8:
             text += f"\n✅ *连赢8期* ({len(win_8)}次)\n"
             for i, r in enumerate(win_8[-5:], 1):
-                start = datetime.fromisoformat(r['start_time']).strftime('%m-%d %H:%M') if isinstance(r['start_time'], str) else r['start_time'].strftime('%m-%d %H:%M')
-                end = datetime.fromisoformat(r['end_time']).strftime('%m-%d %H:%M') if isinstance(r['end_time'], str) else r['end_time'].strftime('%m-%d %H:%M')
+                start = datetime.fromisoformat(r['start_time']).strftime('%m-%d %H:%M')
+                end = datetime.fromisoformat(r['end_time']).strftime('%m-%d %H:%M')
                 text += f"  {i}. {start} → {end}\n"
         
         if win_10:
             text += f"\n✅ *连赢10期* ({len(win_10)}次)\n"
             for i, r in enumerate(win_10[-5:], 1):
-                start = datetime.fromisoformat(r['start_time']).strftime('%m-%d %H:%M') if isinstance(r['start_time'], str) else r['start_time'].strftime('%m-%d %H:%M')
-                end = datetime.fromisoformat(r['end_time']).strftime('%m-%d %H:%M') if isinstance(r['end_time'], str) else r['end_time'].strftime('%m-%d %H:%M')
+                start = datetime.fromisoformat(r['start_time']).strftime('%m-%d %H:%M')
+                end = datetime.fromisoformat(r['end_time']).strftime('%m-%d %H:%M')
                 text += f"  {i}. {start} → {end}\n"
         
         if loss_7:
             text += f"\n❌ *连输7期* ({len(loss_7)}次)\n"
             for i, r in enumerate(loss_7[-5:], 1):
-                start = datetime.fromisoformat(r['start_time']).strftime('%m-%d %H:%M') if isinstance(r['start_time'], str) else r['start_time'].strftime('%m-%d %H:%M')
-                end = datetime.fromisoformat(r['end_time']).strftime('%m-%d %H:%M') if isinstance(r['end_time'], str) else r['end_time'].strftime('%m-%d %H:%M')
+                start = datetime.fromisoformat(r['start_time']).strftime('%m-%d %H:%M')
+                end = datetime.fromisoformat(r['end_time']).strftime('%m-%d %H:%M')
                 text += f"  {i}. {start} → {end}\n"
         
         if loss_8:
             text += f"\n❌ *连输8期* ({len(loss_8)}次)\n"
             for i, r in enumerate(loss_8[-5:], 1):
-                start = datetime.fromisoformat(r['start_time']).strftime('%m-%d %H:%M') if isinstance(r['start_time'], str) else r['start_time'].strftime('%m-%d %H:%M')
-                end = datetime.fromisoformat(r['end_time']).strftime('%m-%d %H:%M') if isinstance(r['end_time'], str) else r['end_time'].strftime('%m-%d %H:%M')
+                start = datetime.fromisoformat(r['start_time']).strftime('%m-%d %H:%M')
+                end = datetime.fromisoformat(r['end_time']).strftime('%m-%d %H:%M')
                 text += f"  {i}. {start} → {end}\n"
         
         if loss_10:
             text += f"\n❌ *连输10期* ({len(loss_10)}次)\n"
             for i, r in enumerate(loss_10[-5:], 1):
-                start = datetime.fromisoformat(r['start_time']).strftime('%m-%d %H:%M') if isinstance(r['start_time'], str) else r['start_time'].strftime('%m-%d %H:%M')
-                end = datetime.fromisoformat(r['end_time']).strftime('%m-%d %H:%M') if isinstance(r['end_time'], str) else r['end_time'].strftime('%m-%d %H:%M')
+                start = datetime.fromisoformat(r['start_time']).strftime('%m-%d %H:%M')
+                end = datetime.fromisoformat(r['end_time']).strftime('%m-%d %H:%M')
                 text += f"  {i}. {start} → {end}\n"
         
         if not (win_7 or win_8 or win_10 or loss_7 or loss_8 or loss_10):
@@ -4045,12 +4100,6 @@ class PC28Bot:
 • 投注周期: {sched_stats['game_stats']['betting_cycles']}
 • 成功投注: {sched_stats['game_stats']['successful_bets']}
 • 失败投注: {sched_stats['game_stats']['failed_bets']}
-
-*算法说明*
-• 自适应网格搜索杀组算法
-• 加权固定和公式: fixed_sum / (latest_total × π)
-• 尾数映射 + 对立面/高频杀组
-• 硅基流动AI辅助验证
         """
         kb = [[InlineKeyboardButton("🔄 刷新", callback_data="refresh_status")],
               [InlineKeyboardButton("🔙 返回", callback_data="menu:main")]]
@@ -4074,23 +4123,6 @@ class PC28Bot:
 • 查询余额/账户状态：点击相应按钮。
 • 手动投注：在游戏群发送“类型 金额”即可，如“大 10000”。
 
-*预测算法说明* 🔮
-
-本系统使用**自适应网格搜索杀组算法**进行预测：
-
-**算法核心步骤：**
-1. **尾数映射**：将0-9数字映射到四个形态（小单、小双、大单、大双）
-2. **加权固定和计算**：基于历史形态参数进行加权计算
-3. **生成小数**：固定和 / (最新和值 × π)
-4. **杀组判断**：
-   - 两个尾数映射相同 → 杀其对立面
-   - 不同 → 统计近期频率，杀出现次数多的（追冷策略）
-5. **自适应参数搜索**：动态优化模型参数，提高命中率
-6. **遗漏值调整**：根据遗漏值动态调整权重
-7. **市场状态判断**：趋势/震荡状态调整窗口大小
-
-**连错惩罚机制**：连续预测错误时自动缩小参数搜索范围
-
 *监听模式说明* 🔍
 监听模式会自动监测您指定的群组中的投注成功消息，当检测到其他用户投注成功时，系统会根据您的预测算法自动执行投注。
 - 设置监听群组后，请确保自动投注已开启
@@ -4104,6 +4136,14 @@ class PC28Bot:
 - CNY：人民币
 
 每个账户可独立选择投注币种，余额和金额显示会自动适配。
+
+*预测算法说明*
+本系统使用杀组算法进行预测：
+• 尾数映射: 0-9尾数映射到大小单双
+• 加权滑动窗口计算，使用遗漏值调整权重
+• 双尾数映射杀组: 相同则取对立面，不同则追冷
+• 自适应参数搜索优化
+• 硅基流动AI辅助验证
 
 *金额策略说明*
 • 保守/平衡/激进：固定倍率，只输翻倍
@@ -4120,7 +4160,7 @@ class PC28Bot:
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _process_run_analysis(self, query):
-        await query.edit_message_text("🔍 正在生成预测（使用自适应网格搜索杀组算法）...")
+        await query.edit_message_text("🔍 正在生成预测（使用杀组算法）...")
         history = await self.api.get_history(50)
         if len(history) < 3:
             await query.edit_message_text("❌ 历史数据不足，至少需要3期数据")
@@ -4130,16 +4170,12 @@ class PC28Bot:
         pred = await self.model.predict(history, latest)
         
         acc_stats = self.model.get_accuracy_stats()
-        
-        kill_predictor = self.model.kill_predictor
-        best_params = kill_predictor.best_params
-        
         text = f"""
 🎯 *PC28预测结果*
 
 📊 *数据信息：*
 • 最新期号: {latest.get('qihao', 'N/A')}
-• 最新结果: {latest.get('sum', 'N/A')} ({latest.get('combo', 'N/A')})
+• 最新结果: {latest.get('total', 'N/A')} ({latest.get('category', 'N/A')})
 
 🏆 *算法预测：*
 • 主推: {pred['main']}
@@ -4149,16 +4185,8 @@ class PC28Bot:
 
 📈 *近期准确率：{acc_stats['overall']['recent']*100:.1f}%*
 
-🔧 *最优参数：*
-• 大单: {best_params.get('大单', 12)}
-• 小单: {best_params.get('小单', 13)}
-• 大双: {best_params.get('大双', 14)}
-• 小双: {best_params.get('小双', 15)}
-
 🧠 *算法说明：*
-• 自适应网格搜索杀组算法
-• 加权固定和公式: 固定和 / (和值 × π)
-• 尾数映射 + 对立面/高频杀组
+• 杀组算法（尾数映射+加权滑动窗口+自适应参数）
 • 硅基流动AI辅助验证
         """
         kb = [[InlineKeyboardButton("🔄 刷新预测", callback_data="run_analysis")],
@@ -4352,9 +4380,7 @@ def main():
     print("""
 ========================================
 PC28自动投注系统
-基于自适应网格搜索杀组算法
-加权固定和公式 + 尾数映射
-AI辅助验证 | 监听模式 | 多币种支持
+基于杀组算法 | AI辅助验证 | 监听模式 | 多币种支持
 支持币种: KKCOIN / USDT / CNY
 ========================================
 启动中...
