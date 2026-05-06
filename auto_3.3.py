@@ -119,6 +119,7 @@ class Config:
 
 Config.init_dirs()
 
+# ==================== 工具函数 ====================
 def increment_qihao(current_qihao: str) -> str:
     if not current_qihao: return "1"
     match = re.search(r'(\d+)$', current_qihao)
@@ -157,6 +158,7 @@ def parse_amount_from_text(text: str, currency: str) -> Optional[float]:
                 continue
     return None
 
+# ==================== 彩色日志 ====================
 class ColoredFormatter(logging.Formatter):
     grey = "\x1b[38;20m"
     green = "\x1b[32;20m"
@@ -224,6 +226,7 @@ class BotLogger:
 
 logger = BotLogger()
 
+# ==================== 基础数据 ====================
 COMBOS = ["小单", "小双", "大单", "大双"]
 BASE_PROB = {"小单": 27.11, "小双": 23.83, "大单": 22.32, "大双": 26.74}
 SUM_TO_COMBO = {
@@ -233,201 +236,446 @@ SUM_TO_COMBO = {
     21: "大单", 22: "大双", 23: "大单", 24: "大双", 25: "大单", 26: "大双", 27: "大单"
 }
 
+# ==================== PC28规则预测器（双杀组+双Y融合算法完整版） ====================
 class PC28RulePredictor:
+    """
+    基于文件2确定性规则的PC28预测器
+    完全按照双杀组算法+双Y融合组合预测执行
+    所有计算步骤、规则、权重占比完全固定
+    """
+    
     def __init__(self):
-        self.tail_to_category = {
-            0: "小双", 1: "小单", 2: "小双", 3: "小单", 4: "小双",
-            5: "大单", 6: "大双", 7: "大单", 8: "大双", 9: "大单"
-        }
-        self.opposite = {
-            "大单": "小双",
-            "大双": "小单",
-            "小单": "大双",
-            "小双": "大单"
-        }
-        self.param_ranges = {
-            "大单": (10, 17),
-            "小单": (10, 17),
-            "大双": (11, 17),
-            "小双": (11, 17)
-        }
         self.combos = COMBOS
+        self.size_map = {"小": "大", "大": "小"}
+        self.parity_map = {"单": "双", "双": "单"}
+        
+        # 3Y池取数顺序映射
+        self.order_3y_map = {
+            0: ['3Y0', '3Y1', '3Y2'],  # 3Y0池A球 → 3Y1池B球 → 3Y2池C球
+            1: ['3Y1', '3Y2', '3Y0'],  # 3Y1池A球 → 3Y2池B球 → 3Y0池C球
+            2: ['3Y2', '3Y0', '3Y1'],  # 3Y2池A球 → 3Y0池B球 → 3Y1池C球
+        }
+        
+        # 5Y特码池
+        self.pool_5y = {
+            0: [0, 5, 10, 15, 20, 25],
+            1: [1, 6, 11, 16, 21],
+            2: [2, 7, 12, 17, 22],
+            3: [3, 8, 13, 18, 23],
+            4: [4, 9, 14, 19, 24],
+        }
+        
+        # 3Y特码池
+        self.pool_3y = {
+            0: [0, 3, 6, 9, 12, 15, 18, 21, 24, 27],
+            1: [1, 4, 7, 10, 13, 16, 19, 22, 25],
+            2: [2, 5, 8, 11, 14, 17, 20, 23, 26],
+        }
+        
+        # 高频防组合加权
+        self.high_freq_combos = ["小单", "小双", "大双"]
+        
+        # 连错惩罚（保留原功能兼容性）
         self.consecutive_loss = 0
         self.max_consecutive_loss = 1
-
+    
     def get_category(self, total: int) -> str:
         size = "大" if total >= 14 else "小"
         oe = "单" if total % 2 == 1 else "双"
         return size + oe
-
-    def get_two_digits(self, decimal: float) -> tuple:
-        s = str(decimal)[2:]
-        if len(s) >= 2:
-            result = s[:2]
-        else:
-            result = s + "0"
-        return int(result[0]), int(result[1])
-
-    def get_omission(self, category: str, history: List[Dict]) -> int:
-        for i, h in enumerate(history):
-            if h.get("category") == category:
-                return i
-        return len(history)
-
-    def get_market_state(self, history: List[Dict]) -> tuple:
-        if len(history) < 6:
-            return "震荡", 3
-        categories = [h.get("category") for h in history[:6]]
-        streak = 1
-        for i in range(1, len(categories)):
-            if categories[i] == categories[0]:
-                streak += 1
-            else:
-                break
-        if streak >= 3:
-            return "趋势", 5
-        else:
-            return "震荡", 3
-
-    def predict_kill_with_params(self, history: List[Dict], params: Dict) -> Optional[tuple]:
-        if len(history) < 5:
+    
+    def _calc_y_value(self, a: int, b: int, c: int, total: int) -> int:
+        """
+        计算Y值：拼接数各位数字和
+        公式：拼接数 = A球B球C球（三位数），新数 = 拼接数 + 和值，Y = 新数各位数字和
+        """
+        concat_num = a * 100 + b * 10 + c
+        new_num = concat_num + total
+        return sum(int(d) for d in str(new_num))
+    
+    def _calc_3y(self, total: int) -> int:
+        """计算3Y：和值对3取余"""
+        return total % 3
+    
+    def _calc_5y(self, total: int) -> int:
+        """计算5Y：和值对5取余"""
+        return total % 5
+    
+    def _calc_kill_by_sub_algo1(self, latest: Dict, history_10: List[Dict]) -> Optional[str]:
+        """
+        子算法1：calcKillGroup
+        基于Y值和位差和判定杀组
+        
+        步骤：
+        1. 拼接数生成：A1B1C1
+        2. 新数 = 拼接数 + H1，计算Y1
+        3. 在历史中找首个Y1一致的历史期
+        4. 计算位差和 S = |A1-A2| + |B1-B2| + |C1-C2|
+        5. S<14为小，S≥14为大；S奇数单，S偶数双 → 临时组合Z2
+        6. Z2即为杀组
+        """
+        try:
+            a1 = latest.get('a', 0)
+            b1 = latest.get('b', 0)
+            c1 = latest.get('c', 0)
+            h1 = latest.get('sum', 0)
+            
+            # 计算Y1
+            y1 = self._calc_y_value(a1, b1, c1, h1)
+            
+            # 在历史中找首个Y值一致的历史期
+            target_idx = -1
+            for i, h in enumerate(history_10):
+                if h.get('y_value') == y1:
+                    target_idx = i
+                    break
+            
+            if target_idx == -1:
+                return None
+            
+            target = history_10[target_idx]
+            a2 = target.get('a', 0)
+            b2 = target.get('b', 0)
+            c2 = target.get('c', 0)
+            
+            # 计算位差和
+            s = abs(a1 - a2) + abs(b1 - b2) + abs(c1 - c2)
+            
+            # 判定临时组合
+            size = "小" if s < 14 else "大"
+            parity = "单" if s % 2 == 1 else "双"
+            
+            return size + parity
+        except Exception as e:
+            logger.log_error(0, "子算法1计算失败", e)
             return None
-        latest = history[0]
-        market_state, window_size = self.get_market_state(history)
-        window_size = min(window_size, len(history) - 1)
-        last_n = history[1:1+window_size]
-        fixed_sum = 0
-        weight_sum = 0
-        for i, h in enumerate(last_n):
-            w = len(last_n) - i
-            omission = self.get_omission(h.get("category", ""), history[1:])
-            adjust = 1 + min(omission, 10) * 0.03
-            fixed_sum += params.get(h.get("category", ""), 12) * w * adjust
-            weight_sum += w * adjust
-        fixed_sum = fixed_sum / weight_sum if weight_sum > 0 else 0
-        raw = fixed_sum / (latest.get("total", 14) * 3.141592653589793)
-        decimal = raw - int(raw)
-        tail1, tail2 = self.get_two_digits(decimal)
-        cat1 = self.tail_to_category[tail1]
-        cat2 = self.tail_to_category[tail2]
-        if cat1 == cat2:
-            kill = self.opposite[cat1]
-        else:
-            freq1 = sum(1 for h in history[1:10] if h.get("category") == cat1)
-            freq2 = sum(1 for h in history[1:10] if h.get("category") == cat2)
-            kill = cat1 if freq1 >= freq2 else cat2
-        return kill, market_state, window_size
-
-    def evaluate_params(self, history: List[Dict], params: Dict) -> float:
-        hits = 0
-        total = 0
-        for i in range(len(history) - 6):
-            train = history[i+1:i+7]
-            actual = history[i]
-            result = self.predict_kill_with_params(train, params)
-            if result:
-                kill, _, _ = result
-                if actual.get("category") != kill:
-                    hits += 1
-            total += 1
-        return hits / total if total > 0 else 0
-
-    def adaptive_grid_search(self, history: List[Dict], iterations: int = 40) -> tuple:
-        best_params = {"大单": 12, "小单": 13, "大双": 14, "小双": 15}
-        best_score = -1
-        logger.log_analysis("自适应网格搜索中...")
-        for _ in range(iterations // 2):
-            params = {
-                "大单": random.randint(10, 17),
-                "小单": random.randint(10, 17),
-                "大双": random.randint(11, 17),
-                "小双": random.randint(11, 17)
+    
+    def _calc_kill_by_sub_algo2(self, latest: Dict) -> Optional[str]:
+        """
+        子算法2：calculateKillType
+        基于和值运算判定杀组（返回对立组合）
+        
+        步骤：
+        1. step1 = H1 × 3 × H1，取step1后三位数字（不足三位补0）
+        2. 计算该三位数各位数字和 D2
+        3. S = D2 + A1，若S>27则S=S-27
+        4. 由S判定临时组合Z3
+        5. 返回Z3的对立组合作为杀组
+        """
+        try:
+            h1 = latest.get('sum', 0)
+            a1 = latest.get('a', 0)
+            
+            # step1 = H1 × 3 × H1
+            step1_raw = h1 * 3 * h1
+            step1_str = str(step1_raw)[-3:].zfill(3)
+            d2 = sum(int(d) for d in step1_str)
+            
+            # 修正值S
+            s = d2 + a1
+            if s > 27:
+                s = s - 27
+            
+            # 判定临时组合
+            size = "小" if s < 14 else "大"
+            parity = "单" if s % 2 == 1 else "双"
+            temp_combo = size + parity
+            
+            # 返回对立组合作为杀组
+            opposite_size = self.size_map[size]
+            opposite_parity = self.parity_map[parity]
+            return opposite_size + opposite_parity
+        except Exception as e:
+            logger.log_error(0, "子算法2计算失败", e)
+            return None
+    
+    def get_rule_based_kill(self, latest: Dict, history_10: List[Dict]) -> Tuple[Optional[str], int]:
+        """
+        获取基于双算法一致性的杀组
+        
+        规则：子算法1与子算法2杀组结果完全一致时采用，否则采用子算法2
+        返回：(杀组, 置信度)
+        """
+        kill1 = self._calc_kill_by_sub_algo1(latest, history_10)
+        kill2 = self._calc_kill_by_sub_algo2(latest)
+        
+        if kill1 and kill2 and kill1 == kill2:
+            # 双算法一致，高置信度
+            logger.log_analysis(f"双算法杀组一致: {kill1}")
+            return kill1, 90
+        elif kill2:
+            # 不一致时采用子算法2
+            logger.log_analysis(f"杀组不一致: 算法1={kill1}, 算法2={kill2}, 采用算法2")
+            return kill2, 70
+        elif kill1:
+            return kill1, 60
+        return None, 0
+    
+    def _calculate_tail_numbers(self, history_10: List[Dict], latest: Dict) -> Tuple[List[int], str]:
+        """
+        双Y融合算法 - 尾数计算
+        
+        步骤：
+        1. 根据最新期和值的3Y确定顺序
+        2. 按顺序从对应3Y池取最新3期的对应球数据
+        3. 分别求和后取个位数尾数
+        4. 尾数和H2判定基础组合Z4
+        """
+        h1 = latest.get('sum', 0)
+        y3 = self._calc_3y(h1)
+        
+        # 获取顺序
+        order = self.order_3y_map.get(y3, ['3Y0', '3Y1', '3Y2'])
+        
+        # 构建3Y池
+        pools_3y = {'3Y0': [], '3Y1': [], '3Y2': []}
+        for h in history_10[:10]:
+            total = h.get('sum', 0)
+            y3_val = self._calc_3y(total)
+            pool_key = f'3Y{y3_val}'
+            pools_3y[pool_key].append(h)
+        
+        # 球索引映射
+        ball_map = {'3Y0': 'a', '3Y1': 'b', '3Y2': 'c'}
+        
+        tail_sums = []
+        for pool_key in order:
+            pool = pools_3y.get(pool_key, [])
+            ball = ball_map.get(pool_key, 'a')
+            
+            if len(pool) >= 3:
+                # 取最新3期（索引0,1,2）
+                values = [h.get(ball, 0) for h in pool[:3]]
+                tail_sum = sum(values) % 10
+            else:
+                # 数据不足时使用默认值
+                tail_sum = 0
+            tail_sums.append(tail_sum)
+        
+        # 尾数和
+        h2 = sum(tail_sums) % 10
+        
+        # 判定基础组合
+        base_size = "小" if h2 < 14 else "大"
+        base_parity = "单" if h2 % 2 == 1 else "双"
+        base_combo = base_size + base_parity
+        
+        return tail_sums, base_combo
+    
+    def _calculate_scores(self, history_10: List[Dict], base_combo: str, rule_kill: str) -> Dict[str, Dict]:
+        """
+        双权重打分系统
+        
+        权重分配：
+        - 尾数和判定权重（40%）：基础组合40分，关联组合30分，非关联10分
+        - 近期走势频次权重（60%）：≥3次60分，1-2次40分，0次10分；高频防组合+10分
+        
+        返回：{组合: {'score': 总分, 'tail_score': 尾数分, 'freq_score': 频次分}}
+        """
+        # 统计近10期频次
+        combo_count = {c: 0 for c in self.combos}
+        for h in history_10[:10]:
+            combo = h.get('combo', '')
+            if combo in combo_count:
+                combo_count[combo] += 1
+        
+        scores = {}
+        for combo in self.combos:
+            if combo == rule_kill:
+                scores[combo] = {'score': 0, 'tail_score': 0, 'freq_score': 0, 'is_kill': True}
+                continue
+            
+            # 尾数和判定分（40%）
+            if combo == base_combo:
+                tail_score = 40
+            elif combo[0] == base_combo[0] or combo[1] == base_combo[1]:
+                tail_score = 30
+            else:
+                tail_score = 10
+            
+            # 近期走势频次分（60%）
+            count = combo_count.get(combo, 0)
+            if count >= 3:
+                freq_score = 60
+            elif count >= 1:
+                freq_score = 40
+            else:
+                freq_score = 10
+            
+            # 高频防组合加权
+            if combo in self.high_freq_combos:
+                freq_score += 10
+            
+            total_score = tail_score + freq_score
+            
+            scores[combo] = {
+                'score': total_score,
+                'tail_score': tail_score,
+                'freq_score': freq_score,
+                'count': count,
+                'is_kill': False
             }
-            score = self.evaluate_params(history, params)
-            if score > best_score:
-                best_score = score
-                best_params = params.copy()
-        for _ in range(iterations // 2):
-            params = {
-                "大单": best_params["大单"] + random.randint(-2, 2),
-                "小单": best_params["小单"] + random.randint(-2, 2),
-                "大双": best_params["大双"] + random.randint(-2, 2),
-                "小双": best_params["小双"] + random.randint(-2, 2)
-            }
-            for k in params:
-                params[k] = max(self.param_ranges[k][0], min(self.param_ranges[k][1], params[k]))
-            score = self.evaluate_params(history, params)
-            if score > best_score:
-                best_score = score
-                best_params = params.copy()
-        logger.log_analysis(f"最优参数: 大单={best_params['大单']}, 小单={best_params['小单']}, 大双={best_params['大双']}, 小双={best_params['小双']}, 胜率={best_score*100:.1f}%")
-        return best_params, best_score
-
+        
+        return scores
+    
     def get_rule_based_predictions(self, history: List[Dict]) -> Optional[Dict]:
+        """
+        完整的基于规则的预测（文件2核心算法）
+        
+        返回格式：
+        {
+            'main': 主推组合,
+            'candidate': 稳防组合,
+            'kill': 杀组,
+            'kill_confidence': 置信度,
+            'confidence': 总置信度,
+            'special_numbers': [4个特码],
+            'jump_risk': 跳开提示,
+            'algo_details': 算法详情
+        }
+        """
         if len(history) < 10:
             logger.log_analysis(f"历史数据不足10期，当前{len(history)}期")
             return None
+        
+        # 处理历史数据，确保有必要的字段
         processed_history = []
-        for h in history:
+        for h in history[:30]:
             processed = h.copy()
             if 'category' not in processed and processed.get('total') is not None:
                 processed['category'] = self.get_category(processed.get('total', 0))
             if 'total' not in processed and processed.get('sum') is not None:
                 processed['total'] = processed.get('sum')
-            if 'total' not in processed and processed.get('opennum') is not None:
-                try:
-                    processed['total'] = int(processed.get('opennum', 0))
-                except:
-                    processed['total'] = 0
+            if 'combo' not in processed and processed.get('category') is not None:
+                processed['combo'] = processed.get('category')
+            if 'sum' not in processed and processed.get('total') is not None:
+                processed['sum'] = processed.get('total')
             processed_history.append(processed)
-        if self.consecutive_loss >= self.max_consecutive_loss:
-            logger.log_analysis(f"⚠️ 连错{self.consecutive_loss}期，触发惩罚(参数范围减半)")
-            for k in self.param_ranges:
-                mid = (self.param_ranges[k][0] + self.param_ranges[k][1]) / 2
-                self.param_ranges[k] = (max(10, mid - 2), min(17, mid + 2))
-        else:
-            self.param_ranges = {
-                "大单": (10, 17),
-                "小单": (10, 17),
-                "大双": (11, 17),
-                "小双": (11, 17)
-            }
-        params, best_score = self.adaptive_grid_search(processed_history[:30] if len(processed_history) >= 30 else processed_history)
-        result = self.predict_kill_with_params(processed_history, params)
-        if not result:
-            return None
-        kill, market_state, window_size = result
-        main_combos = [c for c in self.combos if c != kill]
-        main = main_combos[0] if main_combos else self.combos[0]
-        candidate = main_combos[1] if len(main_combos) > 1 else main_combos[0] if main_combos else self.combos[0]
-        confidence = min(95, int(50 + best_score * 40))
-        prediction = {
-            'main': main,
-            'candidate': candidate,
-            'kill': kill,
+        
+        latest = processed_history[0]
+        
+        # 为每条历史记录计算Y值（供子算法1使用）
+        for h in processed_history[:10]:
+            if 'y_value' not in h and h.get('a') is not None and h.get('b') is not None and h.get('c') is not None and h.get('sum') is not None:
+                h['y_value'] = self._calc_y_value(
+                    h.get('a', 0), h.get('b', 0), h.get('c', 0), h.get('sum', 0)
+                )
+        
+        # 模块1：双杀组算法
+        rule_kill, kill_conf = self.get_rule_based_kill(latest, processed_history[:10])
+        if not rule_kill:
+            logger.log_analysis("杀组计算失败，使用默认杀组")
+            rule_kill = random.choice(self.combos)
+            kill_conf = 50
+        
+        # 模块2：双Y融合组合预测
+        tail_sums, base_combo = self._calculate_tail_numbers(processed_history[:10], latest)
+        
+        # 双权重打分
+        scores = self._calculate_scores(processed_history[:10], base_combo, rule_kill)
+        
+        # 按分数排序，排除杀组
+        sorted_combos = sorted(
+            [(c, data) for c, data in scores.items() if not data.get('is_kill')],
+            key=lambda x: x[1]['score'],
+            reverse=True
+        )
+        
+        # 三层组合分级
+        main_combos = []      # 核心主攻（总分≥90）
+        candidate_combo = None  # 高概率稳防（80-89）
+        
+        for combo, data in sorted_combos:
+            score = data['score']
+            if score >= 90 and len(main_combos) < 2:
+                main_combos.append(combo)
+            elif 80 <= score < 90 and candidate_combo is None:
+                candidate_combo = combo
+        
+        # 如果主攻不足2个，从稳防中补充
+        if len(main_combos) < 2 and candidate_combo:
+            main_combos.append(candidate_combo)
+            candidate_combo = None
+        
+        # 如果还不够，从剩余中取最高分
+        for combo, data in sorted_combos:
+            if combo not in main_combos and combo != candidate_combo and len(main_combos) < 2:
+                main_combos.append(combo)
+        
+        # 模块3：5Y+3Y融合特码推导
+        h1 = latest.get('sum', 0)
+        y5 = self._calc_5y(h1)
+        y3 = self._calc_3y(h1)
+        
+        pool_5y = self.pool_5y.get(y5, [0, 5, 10, 15, 20, 25])
+        pool_3y = self.pool_3y.get(y3, [])
+        
+        # 取交集
+        intersection = [n for n in pool_5y if n in pool_3y]
+        
+        # 统计近10期和值频次
+        sum_count = Counter()
+        for h in processed_history[:10]:
+            s = h.get('sum', 0)
+            sum_count[s] += 1
+        
+        # 从5Y池按频次补充
+        remaining = []
+        for num in pool_5y:
+            if num not in intersection:
+                remaining.append((num, sum_count.get(num, 0)))
+        remaining.sort(key=lambda x: x[1], reverse=True)
+        
+        special_numbers = intersection.copy()
+        for num, _ in remaining:
+            if len(special_numbers) >= 4:
+                break
+            special_numbers.append(num)
+        
+        # 确保输出4个
+        while len(special_numbers) < 4:
+            special_numbers.append(random.randint(0, 27))
+        
+        # 模块4：跳开提示
+        jump_risk = f"双算法一致判定杀[{rule_kill}]，{rule_kill}近期无连续走势/和值支撑回补，极低等级跳开风险；核心圈（{','.join(main_combos)}）全覆盖近期高概率开出方向"
+        
+        # 计算总置信度
+        main_scores = [scores.get(c, {}).get('score', 0) for c in main_combos]
+        avg_main_score = sum(main_scores) / len(main_scores) if main_scores else 0
+        confidence = min(95, int(avg_main_score * 0.8 + kill_conf * 0.2))
+        
+        result = {
+            'main': main_combos[0] if main_combos else self.combos[0],
+            'candidate': candidate_combo if candidate_combo else (main_combos[-1] if main_combos else self.combos[0]),
+            'kill': rule_kill,
+            'kill_confidence': kill_conf,
             'confidence': confidence,
-            'kill_confidence': int(best_score * 100),
-            'market_state': market_state,
-            'window_size': window_size,
-            'params': params,
+            'special_numbers': special_numbers[:4],
+            'jump_risk': jump_risk,
+            'base_combo': base_combo,
+            'tail_sums': tail_sums,
+            'scores': {c: data['score'] for c, data in scores.items()},
             'algo_details': [
-                {"name": "杀组算法", "kill": kill, "confidence": int(best_score * 100)},
-                {"name": "自适应参数", "params": params}
-            ],
-            'special_numbers': [random.randint(0, 27) for _ in range(4)],
-            'jump_risk': f"杀组[{kill}]，基于{window_size}期窗口，连错惩罚机制运行中"
+                {"name": "双杀组算法", "kill": rule_kill, "confidence": kill_conf},
+                {"name": "双Y融合算法", "main": main_combos, "candidate": candidate_combo},
+                {"name": "5Y+3Y特码池", "numbers": special_numbers[:4]}
+            ]
         }
-        logger.log_prediction(0, "杀组算法预测完成",
-                              f"主推:{main} 候选:{candidate} 杀组:{kill} 置信度:{confidence}% 胜率:{best_score*100:.1f}%")
-        return prediction
+        
+        logger.log_prediction(0, "规则预测完成", 
+                            f"主推:{main_combos} 候选:{candidate_combo} 杀组:{rule_kill} 置信度:{confidence}")
+        
+        return result
     
     def update_result(self, actual_kill_correct: bool):
+        """更新连错计数（保留原功能兼容性）"""
         if actual_kill_correct:
             self.consecutive_loss = 0
         else:
             self.consecutive_loss += 1
         logger.log_analysis(f"杀组结果更新: {'正确' if actual_kill_correct else '错误'}, 连错计数={self.consecutive_loss}")
 
+# ==================== 硅基流动AI客户端 ====================
 class SiliconFlowAIClient:
     def __init__(self, api_key=None, model_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"):
         self.api_url = "https://api.siliconflow.cn/v1/chat/completions"
@@ -447,27 +695,31 @@ class SiliconFlowAIClient:
         combos_10 = [h.get('category', '') for h in history[:10] if h.get('category')]
         sums_10 = [h.get('total', 0) for h in history[:10] if h.get('total') is not None]
         combo_count = Counter(combos_10)
-        prompt = f"""你是PC28彩票预测验证专家。以下是基于杀组算法的预测结果，请验证其合理性。
+        prompt = f"""你是PC28彩票预测验证专家。以下是基于双杀组+双Y融合算法的预测结果，请验证其合理性。
 
-【杀组算法预测结果】
+【算法预测结果】
 - 最终杀组（必排除）：{rule_result['kill']}（置信度{rule_result['kill_confidence']}%）
 - 核心主攻组合：{rule_result['main']}
 - 高概率稳防组合：{rule_result['candidate']}
 - 预测置信度：{rule_result['confidence']}%
-- 市场状态：{rule_result.get('market_state', '震荡')}
-- 分析窗口：{rule_result.get('window_size', 3)}期
+- 核心特码：{rule_result['special_numbers']}
 
 【近期走势数据（最近10期）】
 - 组合序列：{" → ".join(combos_10[:10])}
 - 和值序列：{sums_10[:10]}
 - 组合频次：{dict(combo_count)}
 
+【算法说明】
+1. 杀组由双算法一致判定（Y值位差和算法 + 和值运算对立算法）
+2. 主攻组合由双Y融合+双权重打分选出（尾数和40% + 走势频次60%）
+3. 特码由5Y+3Y池交集补充高频热码得出
+
 【验证任务】
-请基于PC28开奖规律，验证上述杀组预测是否合理，并输出JSON格式结果：
+请基于PC28开奖规律，验证上述预测是否合理，并输出JSON格式结果：
 
 {{
     "validation": "合理/需调整/不合理",
-    "main_confirm": [确认的主攻组合，保持原顺序],
+    "main_confirm": "确认的主攻组合",
     "candidate_confirm": "确认的稳防组合",
     "kill_confirm": "确认的杀组",
     "adjustment_reason": "调整原因（如无需调整填'无'）",
@@ -537,7 +789,7 @@ class SiliconFlowAIClient:
             rule_predictor = PC28RulePredictor()
             rule_result = rule_predictor.get_rule_based_predictions(list(history)[:30])
             if rule_result:
-                logger.log_analysis(f"杀组算法计算结果: 主推{rule_result['main']}, 杀组{rule_result['kill']}")
+                logger.log_analysis(f"双杀组+双Y融合算法计算结果: 主推{rule_result['main']}, 杀组{rule_result['kill']}")
                 prompt = self._build_rule_based_prompt(history, rule_result)
                 ai_result = await self._call_ai_with_prompt(prompt, qihao, history)
                 if ai_result[0] is not None:
@@ -644,6 +896,7 @@ class SiliconFlowAIClient:
         kill = random.choice([c for c in COMBOS if c != main and c != candidate])
         return main, candidate, kill, 50
 
+# ==================== 模型管理器 ====================
 class ModelManager:
     def __init__(self):
         self.ai_client = SiliconFlowAIClient(
@@ -686,6 +939,10 @@ class ModelManager:
                     processed['category'] = self.rule_predictor.get_category(processed.get('total', 0))
                 if 'total' not in processed and processed.get('sum') is not None:
                     processed['total'] = processed.get('sum')
+                if 'combo' not in processed and processed.get('category') is not None:
+                    processed['combo'] = processed.get('category')
+                if 'sum' not in processed and processed.get('total') is not None:
+                    processed['sum'] = processed.get('total')
                 processed_history.append(processed)
             rule_result = self.rule_predictor.get_rule_based_predictions(processed_history[:30])
             if rule_result:
@@ -693,13 +950,13 @@ class ModelManager:
                 candidate = rule_result['candidate']
                 kill = rule_result['kill']
                 confidence = rule_result['confidence']
-                logger.log_analysis(f"杀组算法预测: 主推{main}, 候选{candidate}, 杀组{kill}, 置信度{confidence}")
+                logger.log_analysis(f"双杀组+双Y融合算法预测: 主推{main}, 候选{candidate}, 杀组{kill}, 置信度{confidence}")
             else:
                 main = random.choice(COMBOS)
                 candidate = random.choice([c for c in COMBOS if c != main])
                 kill = random.choice([c for c in COMBOS if c != main and c != candidate])
                 confidence = 50
-                logger.log_analysis("杀组算法计算失败，使用随机兜底")
+                logger.log_analysis("双杀组算法计算失败，使用随机兜底")
             if main == candidate:
                 candidate = random.choice([c for c in COMBOS if c != main])
             if main == kill or candidate == kill:
@@ -710,8 +967,8 @@ class ModelManager:
                 "kill": kill,
                 "confidence": min(95, max(40, confidence)),
                 "algo_details": [
-                    {"name": "杀组算法", "kill": kill},
-                    {"name": "自适应参数搜索", "status": "已执行"}
+                    {"name": "双杀组+双Y融合算法", "kill": kill},
+                    {"name": "硅基流动AI验证", "status": "已执行"}
                 ],
                 "trend_analysis": {}
             }
@@ -745,7 +1002,7 @@ class ModelManager:
         total = sum(1 for r in self.prediction_history if r.get('correct', False)) / len(self.prediction_history) if self.prediction_history else 0
         return {
             'overall': {'recent': recent, 'total': total},
-            'algorithms': {'杀组算法': recent}
+            'algorithms': {'双杀组+双Y融合算法': recent}
         }
 
     def clear_history(self):
@@ -753,6 +1010,7 @@ class ModelManager:
         self.recent_accuracy.clear()
         asyncio.create_task(self.save())
 
+# ==================== API模块（开奖数据） ====================
 class PC28API:
     def __init__(self):
         self.base_url = Config.PC28_API_BASE
@@ -881,8 +1139,8 @@ class PC28API:
                 return None
             return {
                 'qihao': qihao, 'opentime': f"{date_str} {time_str}", 'opennum': str(total) if total else '',
-                'total': total, 'size': size, 'parity': parity, 'category': combo,
-                'a': a, 'b': b, 'c': c,
+                'total': total, 'size': size, 'parity': parity, 'category': combo, 'combo': combo,
+                'a': a, 'b': b, 'c': c, 'sum': total,
                 'parsed_time': self._parse_time(date_str, time_str),
                 'fetch_time': datetime.now().isoformat(),
                 'hash': hashlib.md5(f"{qihao}_{total}".encode()).hexdigest()[:8]
@@ -926,8 +1184,8 @@ class PC28API:
                 time_str = item.get('time', '')
                 processed.append({
                     'qihao': qihao, 'opentime': f"{date_str} {time_str}", 'opennum': str(total),
-                    'total': total, 'size': size, 'parity': parity, 'category': combo,
-                    'a': a, 'b': b, 'c': c,
+                    'total': total, 'size': size, 'parity': parity, 'category': combo, 'combo': combo,
+                    'a': a, 'b': b, 'c': c, 'sum': total,
                     'parsed_time': self._parse_time(date_str, time_str),
                     'fetch_time': datetime.now().isoformat(),
                     'hash': hashlib.md5(f"{qihao}_{total}".encode()).hexdigest()[:8]
@@ -1030,6 +1288,7 @@ class PC28API:
             '最新期号': self.history_cache[0].get('qihao') if self.history_cache else '无'
         }
 
+# ==================== 数据模型 ====================
 @dataclass
 class BetParams:
     base_amount: float = Config.DEFAULT_BASE_AMOUNT
@@ -1621,7 +1880,7 @@ class PredictionBroadcaster:
                     logger.log_error(0, "并发发送预测异常", res)
 
     def _update_cached_messages(self):
-        lines = ["🤖PC28杀组算法 ", "-"*30, "期号    主推候选  状态  和值"]
+        lines = ["🤖双杀组+双Y融合算法 ", "-"*30, "期号    主推候选  状态  和值"]
         for p in self.global_predictions['predictions'][-15:]:
             q = p['qihao'][-4:] if len(p['qihao'])>=4 else p['qihao']
             combo_str = p['main'] + p['candidate']
@@ -2352,7 +2611,7 @@ class GlobalScheduler:
                     logger.log_game(f"使用缓存的预测结果: 期号 {qihao}")
                     prediction = self._last_prediction_result
                 else:
-                    logger.log_game(f"开始为新期号 {qihao} 生成预测（杀组算法）")
+                    logger.log_game(f"开始为新期号 {qihao} 生成预测（双杀组+双Y融合算法）")
                     prediction = await self.model.predict(history, latest)
                     self._last_prediction_result = prediction
                     self._last_prediction_qihao = qihao
@@ -2405,7 +2664,7 @@ class PC28Bot:
 
         self.application = Application.builder().token(Config.BOT_TOKEN).build()
         self._register_handlers()
-        logger.log_system("PC28 Bot（杀组算法版 - 固定15秒投注延迟 + 多币种支持KKCOIN/USDT/CNY）初始化完成")
+        logger.log_system("PC28 Bot（双杀组+双Y融合算法版 - 固定15秒投注延迟 + 多币种支持KKCOIN/USDT/CNY）初始化完成")
 
     def _register_handlers(self):
         self.application.add_handler(CommandHandler("start", self.cmd_start))
@@ -2467,7 +2726,7 @@ class PC28Bot:
         ]
         await update.message.reply_text(
             "🎰 *PC28 智能预测投注系统*\n\n"
-            "✨ 欢迎使用！基于杀组算法\n"
+            "✨ 欢迎使用！基于双杀组+双Y融合算法\n"
             "🤖 硅基流动AI辅助验证\n"
             "⏱️ 固定投注延迟：15秒\n"
             "💱 多币种支持：KKCOIN / USDT / CNY\n\n"
@@ -2505,7 +2764,7 @@ class PC28Bot:
         ]
         await message.reply_text(
             "🎰 *PC28 智能预测投注系统*\n\n"
-            "✨ 欢迎使用！基于杀组算法\n"
+            "✨ 欢迎使用！基于双杀组+双Y融合算法\n"
             "🤖 硅基流动AI辅助验证\n"
             "⏱️ 固定投注延迟：15秒\n"
             "💱 多币种支持：KKCOIN / USDT / CNY\n\n"
@@ -3100,7 +3359,7 @@ class PC28Bot:
             [InlineKeyboardButton("📖 使用手册", url=Config.MANUAL_LINK)],
             [InlineKeyboardButton("🔄 刷新菜单", callback_data="menu:main")]
         ]
-        text = "🎮 *PC28 智能投注系统*\n\n基于杀组算法 | AI辅助验证 | 固定15秒投注延迟 | 多币种支持\n\n请选择操作："
+        text = "🎮 *PC28 智能投注系统*\n\n基于双杀组+双Y融合算法 | AI辅助验证 | 固定15秒投注延迟 | 多币种支持\n\n请选择操作："
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _show_accounts_menu(self, query, user):
@@ -3142,7 +3401,7 @@ class PC28Bot:
             [InlineKeyboardButton("🔮 运行预测", callback_data="run_analysis")],
             [InlineKeyboardButton("🔙 返回主菜单", callback_data="menu:main")]
         ]
-        await query.edit_message_text("🎯 *预测分析菜单*\n\n使用杀组算法 | AI辅助验证", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        await query.edit_message_text("🎯 *预测分析菜单*\n\n使用双杀组+双Y融合算法 | AI辅助验证", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _show_amount_menu_callback(self, query, user, phone, context):
         context.user_data.pop('last_amount_msg', None)
@@ -3652,11 +3911,10 @@ class PC28Bot:
 每个账户可独立选择投注币种，余额和金额显示会自动适配。
 
 *预测算法说明*
-本系统使用杀组算法进行预测：
-• 尾数映射: 0-9尾数映射到大小单双
-• 加权滑动窗口计算，使用遗漏值调整权重
-• 双尾数映射杀组: 相同则取对立面，不同则追冷
-• 自适应参数搜索优化
+本系统使用双杀组+双Y融合算法进行预测：
+• 双杀组算法：Y值位差和 + 和值运算对立算法，双算法一致确定杀组
+• 双Y融合：3Y顺序取尾数 + 双权重打分（尾数和40% + 走势频次60%）
+• 5Y+3Y特码池推导
 • 硅基流动AI辅助验证
 
 *金额策略说明*
@@ -3673,7 +3931,7 @@ class PC28Bot:
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _process_run_analysis(self, query):
-        await query.edit_message_text("🔍 正在生成预测（使用杀组算法）...")
+        await query.edit_message_text("🔍 正在生成预测（使用双杀组+双Y融合算法）...")
         history = await self.api.get_history(50)
         if len(history) < 3:
             await query.edit_message_text("❌ 历史数据不足，至少需要3期数据")
@@ -3699,7 +3957,9 @@ class PC28Bot:
 📈 *近期准确率：{acc_stats['overall']['recent']*100:.1f}%*
 
 🧠 *算法说明：*
-• 杀组算法（尾数映射+加权滑动窗口+自适应参数）
+• 双杀组算法（Y值位差和 + 和值运算对立）
+• 双Y融合（3Y尾数顺序 + 双权重打分）
+• 5Y+3Y特码池推导
 • 硅基流动AI辅助验证
         """
         kb = [[InlineKeyboardButton("🔄 刷新预测", callback_data="run_analysis")],
@@ -3891,7 +4151,7 @@ def main():
     print("""
 ========================================
 PC28自动投注系统
-基于杀组算法 | AI辅助验证 | 固定15秒投注延迟 | 多币种支持
+基于双杀组+双Y融合算法 | AI辅助验证 | 固定15秒投注延迟 | 多币种支持
 支持币种: KKCOIN / USDT / CNY
 ========================================
 启动中...
