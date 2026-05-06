@@ -70,7 +70,7 @@ class Config:
     EXPLORATION_DECAY = 0.95
     NOISE_SCALE = 0.05
     MODEL_SAVE_FILE = "pc28_model.json"
-    BALANCE_CACHE_SECONDS = 60
+    BALANCE_CACHE_SECONDS = 120
     MAX_CONCURRENT_BETS = 3
     LOG_RETENTION_DAYS = 7
     ACCOUNT_SAVE_INTERVAL = 30
@@ -1126,6 +1126,7 @@ class AccountManager:
         self.update_lock = asyncio.Lock()
         self.account_locks: Dict[str, asyncio.Lock] = {}
         self.balance_cache: Dict[str, Dict] = {}
+        self._balance_query_locks: Dict[str, asyncio.Lock] = {}
         self._dirty: Set[str] = set()
         self._save_task: Optional[asyncio.Task] = None
         self.load_accounts()
@@ -1763,7 +1764,6 @@ class GameScheduler:
         if not acc: 
             return
         
-        # 检查追号结果
         if acc.chase_enabled and acc.last_bet_period == expected_qihao:
             actual_num = latest_result.get('total')
             if actual_num is not None and actual_num in acc.chase_numbers:
@@ -1847,7 +1847,6 @@ class GameScheduler:
         bet_amount = min(bet_amount, max_limit)
         bet_amount = max(bet_amount, min_limit)
         
-        # 修复：消息格式改为 "数字 金额" 而不是 "数字/金额"
         bet_items = [f"{num} {bet_amount}" for num in acc.chase_numbers]
         if not bet_items: 
             return
@@ -1868,7 +1867,6 @@ class GameScheduler:
                 last_bet_amount=bet_amount, 
                 last_bet_total=total_needed)
             logger.log_betting(0, "追号成功", f"账户:{phone} 数字:{acc.chase_numbers} 金额:{format_amount(bet_amount, acc.currency)} 进度:{new_current}/{acc.chase_periods}")
-            asyncio.create_task(self._query_balance(phone))
 
     async def _query_single_balance(self, phone: str) -> Optional[float]:
         balances = await self._query_balance(phone)
@@ -1879,93 +1877,101 @@ class GameScheduler:
         return None
 
     async def _query_balance(self, phone: str) -> Optional[Dict[str, float]]:
-        client = self.account_manager.clients.get(phone)
-        acc = self.account_manager.get_account(phone)
-        if not client or not acc or not await self.account_manager.ensure_client_connected(phone):
-            return None
-        
-        try:
-            for retry in range(3):
-                try:
-                    await client.send_message(Config.BALANCE_BOT, "/start")
-                    break
-                except FloodWaitError as e:
-                    wait_seconds = e.seconds
-                    logger.log_betting(0, f"余额查询触发限流，等待 {wait_seconds} 秒", f"账户:{phone}")
-                    if retry < 2: 
-                        await asyncio.sleep(min(wait_seconds, 30))
-                    else: 
-                        return None
+        lock = self.account_manager._balance_query_locks.setdefault(phone, asyncio.Lock())
+        async with lock:
+            cached = self.account_manager.get_cached_balance(phone)
+            if cached is not None:
+                acc = self.account_manager.get_account(phone)
+                if acc:
+                    return {acc.currency: cached}
             
-            start_dt = datetime.now()
-            balances = {'KKCOIN': 0.0, 'USDT': 0.0, 'CNY': 0.0}
+            client = self.account_manager.clients.get(phone)
+            acc = self.account_manager.get_account(phone)
+            if not client or not acc or not await self.account_manager.ensure_client_connected(phone):
+                return None
             
-            while (datetime.now() - start_dt).total_seconds() < 10:
-                await asyncio.sleep(1)
-                msgs = await client.get_messages(Config.BALANCE_BOT, limit=5)
-                for msg in msgs:
-                    if msg.text:
-                        text = msg.text
-                        logger.log_api("余额原始消息", text[:200])
-                        
-                        kk_match = re.search(r'KKCOIN\s*[:：]\s*([\d,]+\.?\d*)', text, re.IGNORECASE)
-                        if kk_match:
-                            balances['KKCOIN'] = float(kk_match.group(1).replace(',', ''))
-                        
-                        usdt_match = re.search(r'USDT\s*[:：]\s*([\d,]+\.?\d*)', text, re.IGNORECASE)
-                        if usdt_match:
-                            balances['USDT'] = float(usdt_match.group(1).replace(',', ''))
-                        
-                        cny_match = re.search(r'CNY\s*[:：]\s*([\d,]+\.?\d*)', text, re.IGNORECASE)
-                        if cny_match:
-                            balances['CNY'] = float(cny_match.group(1).replace(',', ''))
-                        
-                        if balances['KKCOIN'] > 0 or balances['USDT'] > 0 or balances['CNY'] > 0:
-                            break
+            try:
+                for retry in range(3):
+                    try:
+                        await client.send_message(Config.BALANCE_BOT, "/start")
+                        break
+                    except FloodWaitError as e:
+                        wait_seconds = e.seconds
+                        logger.log_betting(0, f"余额查询触发限流，等待 {wait_seconds} 秒", f"账户:{phone}")
+                        if retry < 2: 
+                            await asyncio.sleep(min(wait_seconds, 30))
+                        else: 
+                            return None
                 
-                if balances['KKCOIN'] > 0 or balances['USDT'] > 0 or balances['CNY'] > 0:
-                    break
-            
-            selected_balance = balances.get(acc.currency, 0)
-            self.account_manager.update_balance_cache(phone, selected_balance)
-            
-            if acc.initial_balance == 0:
+                start_dt = datetime.now()
+                balances = {'KKCOIN': 0.0, 'USDT': 0.0, 'CNY': 0.0}
+                
+                while (datetime.now() - start_dt).total_seconds() < 10:
+                    await asyncio.sleep(1)
+                    msgs = await client.get_messages(Config.BALANCE_BOT, limit=5)
+                    for msg in msgs:
+                        if msg.text:
+                            text = msg.text
+                            logger.log_api("余额原始消息", text[:200])
+                            
+                            kk_match = re.search(r'KKCOIN\s*[:：]\s*([\d,]+\.?\d*)', text, re.IGNORECASE)
+                            if kk_match:
+                                balances['KKCOIN'] = float(kk_match.group(1).replace(',', ''))
+                            
+                            usdt_match = re.search(r'USDT\s*[:：]\s*([\d,]+\.?\d*)', text, re.IGNORECASE)
+                            if usdt_match:
+                                balances['USDT'] = float(usdt_match.group(1).replace(',', ''))
+                            
+                            cny_match = re.search(r'CNY\s*[:：]\s*([\d,]+\.?\d*)', text, re.IGNORECASE)
+                            if cny_match:
+                                balances['CNY'] = float(cny_match.group(1).replace(',', ''))
+                            
+                            if balances['KKCOIN'] > 0 or balances['USDT'] > 0 or balances['CNY'] > 0:
+                                break
+                    
+                    if balances['KKCOIN'] > 0 or balances['USDT'] > 0 or balances['CNY'] > 0:
+                        break
+                
+                selected_balance = balances.get(acc.currency, 0)
+                self.account_manager.update_balance_cache(phone, selected_balance)
+                
+                if acc.initial_balance == 0:
+                    await self.account_manager.update_account(phone, 
+                        initial_balance=selected_balance, 
+                        balance=selected_balance,
+                        last_balance=selected_balance, 
+                        last_balance_check=datetime.now().isoformat())
+                    return balances
+                
+                old = acc.balance
+                change = selected_balance - old
+                new_profit = acc.total_profit
+                new_loss = acc.total_loss
+                if change > 0: 
+                    new_profit += change
+                elif change < 0: 
+                    new_loss += -change
+                
                 await self.account_manager.update_account(phone, 
-                    initial_balance=selected_balance, 
-                    balance=selected_balance,
-                    last_balance=selected_balance, 
-                    last_balance_check=datetime.now().isoformat())
+                    balance=selected_balance, 
+                    last_balance=old,
+                    last_balance_check=datetime.now().isoformat(), 
+                    total_profit=new_profit, 
+                    total_loss=new_loss)
+                
+                if acc.auto_betting:
+                    if acc.bet_params.stop_balance > 0 and selected_balance < acc.bet_params.stop_balance:
+                        await self.stop_auto_betting(phone, 0)
+                        await self.account_manager.update_account(phone, stop_reason=f"余额低于阈值({acc.currency})")
+                    elif acc.bet_params.resume_balance > 0 and selected_balance >= acc.bet_params.resume_balance:
+                        if not acc.auto_betting and acc.stop_reason and "余额低于阈值" in acc.stop_reason:
+                            await self.start_auto_betting(phone, 0)
+                            await self.account_manager.update_account(phone, stop_reason=None)
+                
                 return balances
-            
-            old = acc.balance
-            change = selected_balance - old
-            new_profit = acc.total_profit
-            new_loss = acc.total_loss
-            if change > 0: 
-                new_profit += change
-            elif change < 0: 
-                new_loss += -change
-            
-            await self.account_manager.update_account(phone, 
-                balance=selected_balance, 
-                last_balance=old,
-                last_balance_check=datetime.now().isoformat(), 
-                total_profit=new_profit, 
-                total_loss=new_loss)
-            
-            if acc.auto_betting:
-                if acc.bet_params.stop_balance > 0 and selected_balance < acc.bet_params.stop_balance:
-                    await self.stop_auto_betting(phone, 0)
-                    await self.account_manager.update_account(phone, stop_reason=f"余额低于阈值({acc.currency})")
-                elif acc.bet_params.resume_balance > 0 and selected_balance >= acc.bet_params.resume_balance:
-                    if not acc.auto_betting and acc.stop_reason and "余额低于阈值" in acc.stop_reason:
-                        await self.start_auto_betting(phone, 0)
-                        await self.account_manager.update_account(phone, stop_reason=None)
-            
-            return balances
-        except Exception as e:
-            logger.log_error(0, f"查询余额失败 {phone}", e)
-            return None
+            except Exception as e:
+                logger.log_error(0, f"查询余额失败 {phone}", e)
+                return None
 
     async def execute_bet(self, phone, prediction, latest):
         acc = self.account_manager.get_account(phone)
@@ -1978,7 +1984,6 @@ class GameScheduler:
                 return
             acc.betting_in_progress = True
         try:
-            # 使用固定的15秒延迟
             logger.log_delay(0, f"投注延迟 {Config.DEFAULT_BET_DELAY_SECONDS} 秒", f"账户:{phone}")
             await asyncio.sleep(Config.DEFAULT_BET_DELAY_SECONDS)
             
@@ -2050,7 +2055,6 @@ class GameScheduler:
                     last_bet_period=current_qihao)
                 logger.log_betting(0, "投注成功", 
                     f"账户:{phone} 币种:{acc.currency} 每注:{format_amount(bet_amount, acc.currency)} 总金额:{format_amount(total, acc.currency)} 类型:{bet_types} 置信度:{prediction['confidence']:.1f}%")
-                asyncio.create_task(self._query_balance(phone))
             else:
                 self.game_stats['failed_bets'] += 1
                 logger.log_betting(0, "投注失败", f"账户:{phone}")
@@ -2207,7 +2211,6 @@ class GameScheduler:
                 last_bet_types=[bet_type],
                 total_bets=acc.total_bets+1, 
                 last_bet_period=current_qihao)
-            asyncio.create_task(self._query_balance(phone))
             return True, f'已发送投注: {bet_type} {format_amount(amount, acc.currency)}'
         return False, '发送投注失败'
 
