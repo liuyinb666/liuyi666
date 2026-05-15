@@ -236,7 +236,7 @@ SUM_TO_COMBO = {
 
 
 # ==================== PC28 500策略杀组预测模型 ====================
-class PC28ProPredictor:
+class PC28Predictor500:
     """
     500策略杀组预测模型
     通过参数变化自动生成500种不同策略
@@ -632,7 +632,8 @@ class PC28ProPredictor:
     
     def validate_accuracy(self, records, strategy_func, test_periods=20):
         """验证策略准确率"""
-        if len(records) < test_periods + 50:
+        min_required = test_periods + 10  # 降低门槛：至少30条数据即可
+        if len(records) < min_required:
             return None
         correct = 0
         total = 0
@@ -649,7 +650,7 @@ class PC28ProPredictor:
                 pass
         return correct / total if total > 0 else 0
     
-    def predict(self, history, top_n=20):
+    def predict(self, history, top_n=100):
         """主预测函数 - 使用500策略自动选优"""
         processed = []
         for r in history:
@@ -685,11 +686,13 @@ class PC28ProPredictor:
         results.sort(key=lambda x: x['accuracy'], reverse=True)
         best = results[0] if results else None
         
+        # 扩大投票范围到Top100，增加多样性
         top_results = results[:top_n]
         votes = Counter([r['shazu'] for r in top_results])
         vote_shazu = votes.most_common(1)[0][0] if votes else self.combos[0]
         
-        if best and best['accuracy'] >= 0.85:
+        # 最优策略和投票不一致时，使用最优策略（准确率>=80%时）
+        if best and best['accuracy'] >= 0.80:
             final_shazu = best['shazu']
             confidence = int(best['accuracy'] * 100)
         else:
@@ -734,7 +737,7 @@ class ModelManager:
         self._predict_lock = asyncio.Lock()
         self._last_predict_result = None
         self._last_predict_qihao = None
-        self.predictor = PC28ProPredictor()
+        self.predictor = PC28Predictor500()
 
     async def save(self):
         async with self._save_lock:
@@ -2409,7 +2412,7 @@ class GlobalScheduler:
                 if acc.last_bet_period and acc.last_bet_period != qihao:
                     self._create_task(self.game_scheduler.check_bet_result(phone, acc.last_bet_period, latest))
             
-            history = await self.api.get_history(50)
+            history = await self.api.get_history(200)
             if len(history) < 3: 
                 logger.log_game("历史数据不足，跳过预测")
                 return
