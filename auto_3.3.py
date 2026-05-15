@@ -1672,7 +1672,7 @@ class PredictionBroadcaster:
                     logger.log_error(0, "并发发送预测异常", res)
 
     def _update_cached_messages(self):
-        lines = ["🤖双杀组+双Y融合算法 ", "-"*30, "期号    主推候选  状态  和值"]
+        lines = ["🤖500策略杀组预测模型 ", "-"*30, "期号    主推候选  状态  和值"]
         for p in self.global_predictions['predictions'][-15:]:
             q = p['qihao'][-4:] if len(p['qihao'])>=4 else p['qihao']
             combo_str = p['main'] + p['candidate']
@@ -1681,7 +1681,7 @@ class PredictionBroadcaster:
             lines.append(f"{q:4s}   {combo_str:4s}   {mark:2s}   {s:>2s}")
         self.global_predictions['cached_double_message'] = "AI双组预测\n```" + "\n".join(lines) + "\n```"
         
-        kill_lines = ["🤖AI杀组", "-"*30, "期号    杀组    状态  和值"]
+        kill_lines = ["🤖500策略杀组预测", "-"*30, "期号    杀组    状态  和值"]
         for p in self.global_predictions['predictions'][-15:]:
             q = p['qihao'][-4:] if len(p['qihao'])>=4 else p['qihao']
             kill = p.get('kill_group', '--')
@@ -2047,10 +2047,13 @@ class GameScheduler:
             current_qihao = latest.get('qihao')
             if acc.last_bet_period == current_qihao: 
                 return
-            now = datetime.now()
-            next_open = latest['parsed_time'] + timedelta(seconds=Config.GAME_CYCLE_SECONDS)
+            # 使用API返回的时间作为基准，避免本地时区问题
+            api_now = latest.get('parsed_time', datetime.now())
+            next_open = api_now + timedelta(seconds=Config.GAME_CYCLE_SECONDS)
             close_time = next_open - timedelta(seconds=Config.CLOSE_BEFORE_SECONDS)
-            if now >= close_time: 
+            # 计算距离封盘还有多少秒（基于API时间）
+            seconds_to_close = (close_time - api_now).total_seconds()
+            if seconds_to_close <= 0: 
                 logger.log_betting(0, "已封盘，跳过投注", f"账户:{phone}")
                 return
             
