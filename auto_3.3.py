@@ -80,7 +80,7 @@ class Config:
     CHASE_NUMBERS, CHASE_PERIODS, CHASE_AMOUNT = range(11, 14)
     MAX_ACCOUNTS_PER_USER = 5
     KJ_HISTORY_DOWNLOAD = 1000
-    DEFAULT_BET_DELAY_SECONDS = 15
+    DEFAULT_BET_DELAY_SECONDS = 25
     
     AVAILABLE_CURRENCIES = ["KKCOIN", "USDT", "CNY"]
     DEFAULT_CURRENCY = "KKCOIN"
@@ -2660,7 +2660,7 @@ class PC28Bot:
 
         self.application = Application.builder().token(Config.BOT_TOKEN).build()
         self._register_handlers()
-        logger.log_system("PC28 Bot（双杀组+双Y融合算法版 - 固定15秒投注延迟 + 多币种支持KKCOIN/USDT/CNY）初始化完成")
+        logger.log_system("PC28 Bot（双杀组+双Y融合算法版 - 固定25秒投注延迟 + 多币种支持KKCOIN/USDT/CNY）初始化完成")
 
     def _register_handlers(self):
         self.application.add_handler(CommandHandler("start", self.cmd_start))
@@ -2724,7 +2724,7 @@ class PC28Bot:
             "🎰 *PC28 智能预测投注系统*\n\n"
             "✨ 欢迎使用！基于双杀组+双Y融合算法\n"
             "🤖 硅基流动AI辅助验证\n"
-            "⏱️ 固定投注延迟：15秒\n"
+            "⏱️ 固定投注延迟：25秒\n"
             "💱 多币种支持：KKCOIN / USDT / CNY\n\n"
             "请选择操作：",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -2762,7 +2762,7 @@ class PC28Bot:
             "🎰 *PC28 智能预测投注系统*\n\n"
             "✨ 欢迎使用！基于双杀组+双Y融合算法\n"
             "🤖 硅基流动AI辅助验证\n"
-            "⏱️ 固定投注延迟：15秒\n"
+            "⏱️ 固定投注延迟：25秒\n"
             "💱 多币种支持：KKCOIN / USDT / CNY\n\n"
             "请选择操作：",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -3104,7 +3104,7 @@ class PC28Bot:
             status += f" | 🔢 追{acc.chase_current}/{acc.chase_periods}"
             kb.insert(4, [InlineKeyboardButton("🛑 停止追号", callback_data=f"action:stopchase:{phone}")])
 
-        text = f"📱 *账户: {display}*\n\n状态: {status}\n币种: {acc.currency}\n余额: {format_amount(acc.balance, acc.currency)}\n净盈利: {format_amount(net_profit, acc.currency)}\n固定投注延迟: 15秒\n\n选择操作:"
+        text = f"📱 *账户: {display}*\n\n状态: {status}\n币种: {acc.currency}\n余额: {format_amount(acc.balance, acc.currency)}\n净盈利: {format_amount(net_profit, acc.currency)}\n固定投注延迟: 25秒\n\n选择操作:"
         return text, InlineKeyboardMarkup(kb)
 
     async def _show_account_detail(self, target, user, phone, context):
@@ -3329,7 +3329,7 @@ class PC28Bot:
             [InlineKeyboardButton("📖 使用手册", url=Config.MANUAL_LINK)],
             [InlineKeyboardButton("🔄 刷新菜单", callback_data="menu:main")]
         ]
-        text = "🎮 *PC28 智能投注系统*\n\n基于双杀组+双Y融合算法 | AI辅助验证 | 固定15秒投注延迟 | 多币种支持\n\n请选择操作："
+        text = "🎮 *PC28 智能投注系统*\n\n基于双杀组+双Y融合算法 | AI辅助验证 | 固定25秒投注延迟 | 多币种支持\n\n请选择操作："
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
 
     async def _show_accounts_menu(self, query, user):
@@ -3589,7 +3589,7 @@ class PC28Bot:
 • 昵称: {acc.display_name or '无'}
 • 登录状态: {'✅ 已登录' if acc.is_logged_in else '❌ 未登录'}
 • 投注币种: {acc.currency}
-• 投注延迟: 固定15秒
+• 投注延迟: 固定25秒
 
 *状态:*
 • 自动投注: {'✅ 开启' if acc.auto_betting else '❌ 关闭'}
@@ -3728,7 +3728,7 @@ class PC28Bot:
 • 已登录: {logged}
 • 自动投注: {auto}
 • 预测播报: {broadcast}
-• 投注延迟: 固定15秒
+• 投注延迟: 固定25秒
 
 *盈利统计*
 • 总盈利: {format_amount(total_profit, 'KKCOIN')}
@@ -3753,7 +3753,7 @@ class PC28Bot:
 • 添加账户：在“账户管理”中点击“➕ 添加账户”，输入手机号即可。
 • 登录：在账户列表中选择账户，点击“🔐 登录”。
 • 设置群组：进入账户详情，点击“💬 游戏群”或“📢 播报群”从列表中选择。
-• 投注延迟：固定15秒，无需设置。
+• 投注延迟：固定25秒，无需设置。
 • 币种设置：点击“💱 投注币种”，选择 KKCOIN/USDT/CNY。
 • 投注设置：在“投注设置”区域设置金额和追号。
 • 播报设置：在“播报设置”区域选择播报群和播报内容（双组/杀组）。
@@ -3761,7 +3761,7 @@ class PC28Bot:
 • 查询余额/账户状态：点击相应按钮。
 
 *投注延迟说明* ⏱️
-系统固定使用15秒投注延迟，检测到新期号后等待15秒再执行投注，确保避开高峰期。
+系统固定使用25秒投注延迟，检测到新期号后等待25秒再执行投注，确保避开高峰期。
 
 *多币种支持* 💱
 系统支持三种币种：
@@ -4003,7 +4003,7 @@ def main():
     print("""
 ========================================
 PC28自动投注系统
-基于双杀组+双Y融合算法 | AI辅助验证 | 固定15秒投注延迟 | 多币种支持
+基于双杀组+双Y融合算法 | AI辅助验证 | 固定25秒投注延迟 | 多币种支持
 支持币种: KKCOIN / USDT / CNY
 ========================================
 启动中...
